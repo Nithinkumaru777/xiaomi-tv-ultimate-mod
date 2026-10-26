@@ -29,6 +29,7 @@ import android.view.View;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -79,6 +80,7 @@ public class MobileControlService extends AccessibilityService {
     private float padMoveAccumX = 0f;
     private float padMoveAccumY = 0f;
     private long lastDpadStepMs = 0L;
+    private long lastHoverSendMs = 0L;
 
     private ServerSocket serverSocket;
     private volatile boolean running = false;
@@ -159,6 +161,27 @@ public class MobileControlService extends AccessibilityService {
                     }
                 }
             }
+            List<AccessibilityWindowInfo> windows = getWindows();
+            if (windows != null) {
+                for (AccessibilityWindowInfo w : windows) {
+                    if (w.getType() == AccessibilityWindowInfo.TYPE_APPLICATION) {
+                        AccessibilityNodeInfo wr = w.getRoot();
+                        if (wr != null) {
+                            CharSequence wp = wr.getPackageName();
+                            wr.recycle();
+                            if (wp != null && wp.length() > 0) {
+                                String pkg = wp.toString();
+                                if (!"com.gathin.mobilecontrol".equals(pkg)
+                                        && !"com.android.systemui".equals(pkg)
+                                        && !"android".equals(pkg)) {
+                                    activePackage = pkg;
+                                    return activePackage;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         } catch (Exception ignored) {}
         return activePackage != null ? activePackage : "";
     }
@@ -173,7 +196,14 @@ public class MobileControlService extends AccessibilityService {
     }
 
     private boolean isDpadFirstTvApp(String pkg) {
-        return !isBrowserOrTouchApp(pkg);
+        if (pkg == null || pkg.isEmpty()) return false;
+        return "com.google.android.youtube.tv".equals(pkg)
+                || "com.netflix.ninja".equals(pkg)
+                || "com.amazon.amazonvideo.livingroom".equals(pkg)
+                || "in.startv.hotstar".equals(pkg)
+                || "com.gathin.tvhome".equals(pkg)
+                || "com.android.tv.settings".equals(pkg)
+                || "com.droidlogic.tv.settings".equals(pkg);
     }
 
     private boolean sendDaemonCmd(String cmdLine) {
@@ -403,6 +433,13 @@ public class MobileControlService extends AccessibilityService {
                 windowManager.updateViewLayout(cursorView, cursorParams);
             } catch (Exception ignored) {
             }
+            final int tipX = Math.max(0, Math.min(screenW - 1, (int) (cursorX + 5f)));
+            final int tipY = Math.max(0, Math.min(screenH - 1, (int) (cursorY + 4f)));
+            long now = System.currentTimeMillis();
+            if (now - lastHoverSendMs >= 26) {
+                lastHoverSendMs = now;
+                bgPool.execute(() -> sendDaemonCmd("HOVER " + tipX + " " + tipY));
+            }
         });
     }
 
@@ -432,8 +469,8 @@ public class MobileControlService extends AccessibilityService {
                 showCursorAndScheduleHide();
                 cursorView.playClickPulse();
             }
-            final int tapX = (int) cursorX;
-            final int tapY = (int) cursorY;
+            final int tapX = Math.max(0, Math.min(screenW - 1, (int) (cursorX + 5f)));
+            final int tapY = Math.max(0, Math.min(screenH - 1, (int) (cursorY + 4f)));
 
             try {
                 AccessibilityNodeInfo root = getRootInActiveWindow();
@@ -452,7 +489,7 @@ public class MobileControlService extends AccessibilityService {
             }
 
             bgPool.execute(() -> {
-                String cmd = (longPress ? "LONGTAP " : "TAP ") + tapX + " " + tapY;
+                String cmd = (longPress ? "LONGTAP " : "MOUSECLICK ") + tapX + " " + tapY;
                 if (!sendDaemonCmd(cmd)) {
                     mainHandler.post(() -> {
                         try {
@@ -470,8 +507,8 @@ public class MobileControlService extends AccessibilityService {
 
     private void scrollAtCursor(float dx, float dy) {
         final String fg = getForegroundPackage();
-        final float cx = remoteMode ? (screenW / 2f) : cursorX;
-        final float cy = remoteMode ? (screenH / 2f) : cursorY;
+        final float cx = remoteMode ? (screenW / 2f) : (cursorX + 5f);
+        final float cy = remoteMode ? (screenH / 2f) : (cursorY + 4f);
 
         bgPool.execute(() -> {
             // For TV highlight apps (YouTube, Netflix, Prime Video, Hotstar, Home Launcher),
@@ -511,13 +548,13 @@ public class MobileControlService extends AccessibilityService {
                 return;
             }
 
-            // For standard Android apps & browsers (Brave Browser):
-            // Inject high-sensitivity Mouse Wheel + Touchscreen Drag via ShellInputDaemon
-            float startX = Math.max(80f, Math.min(screenW - 80f, cx));
-            float startY = Math.max(80f, Math.min(screenH - 80f, cy));
+            // For Brave Browser & touch apps:
+            // Inject pure PC Mouse Wheel scroll (WHEEL) at the cursor tip without accidental drag-clicks!
+            float startX = Math.max(40f, Math.min(screenW - 40f, cx));
+            float startY = Math.max(40f, Math.min(screenH - 40f, cy));
             float clampedDx = Math.max(-520f, Math.min(520f, dx));
             float clampedDy = Math.max(-520f, Math.min(520f, dy));
-            if (sendDaemonCmd("SCROLL " + (int) startX + " " + (int) startY + " " + (int) clampedDx + " " + (int) clampedDy)) {
+            if (sendDaemonCmd("WHEEL " + (int) startX + " " + (int) startY + " " + (int) clampedDx + " " + (int) clampedDy)) {
                 return;
             }
             mainHandler.post(() -> {

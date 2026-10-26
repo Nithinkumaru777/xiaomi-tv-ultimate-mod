@@ -66,6 +66,20 @@ public final class ShellInputDaemon {
                 if ("KEY".equals(cmd) && parts.length >= 2) {
                     int code = Integer.parseInt(parts[1]);
                     injectKey(code);
+                } else if ("HOVER".equals(cmd) && parts.length >= 3) {
+                    float x = Float.parseFloat(parts[1]);
+                    float y = Float.parseFloat(parts[2]);
+                    injectMouseHover(x, y);
+                } else if ("MOUSECLICK".equals(cmd) && parts.length >= 3) {
+                    float x = Float.parseFloat(parts[1]);
+                    float y = Float.parseFloat(parts[2]);
+                    injectMouseClick(x, y);
+                } else if ("WHEEL".equals(cmd) && parts.length >= 5) {
+                    float x = Float.parseFloat(parts[1]);
+                    float y = Float.parseFloat(parts[2]);
+                    float dx = Float.parseFloat(parts[3]);
+                    float dy = Float.parseFloat(parts[4]);
+                    injectMouseWheelOnly(x, y, dx, dy);
                 } else if ("TAP".equals(cmd) && parts.length >= 3) {
                     float x = Float.parseFloat(parts[1]);
                     float y = Float.parseFloat(parts[2]);
@@ -109,6 +123,91 @@ public final class ShellInputDaemon {
                 KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0, source);
         injectEvent(down);
         injectEvent(up);
+    }
+
+    private static void injectMouseHover(float x, float y) {
+        try {
+            long now = SystemClock.uptimeMillis();
+            MotionEvent.PointerProperties[] props = new MotionEvent.PointerProperties[1];
+            props[0] = new MotionEvent.PointerProperties();
+            props[0].id = 0;
+            props[0].toolType = MotionEvent.TOOL_TYPE_MOUSE;
+
+            MotionEvent.PointerCoords[] coords = new MotionEvent.PointerCoords[1];
+            coords[0] = new MotionEvent.PointerCoords();
+            coords[0].x = x;
+            coords[0].y = y;
+            coords[0].pressure = 0.0f;
+            coords[0].size = 1.0f;
+
+            MotionEvent hover = MotionEvent.obtain(now, now, MotionEvent.ACTION_HOVER_MOVE, 1, props, coords,
+                    0, 0, 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_MOUSE, 0);
+            injectEvent(hover);
+            hover.recycle();
+        } catch (Throwable ignored) {}
+    }
+
+    private static void injectMouseClick(float x, float y) {
+        try {
+            long downTime = SystemClock.uptimeMillis();
+            MotionEvent.PointerProperties[] props = new MotionEvent.PointerProperties[1];
+            props[0] = new MotionEvent.PointerProperties();
+            props[0].id = 0;
+            props[0].toolType = MotionEvent.TOOL_TYPE_MOUSE;
+
+            MotionEvent.PointerCoords[] coords = new MotionEvent.PointerCoords[1];
+            coords[0] = new MotionEvent.PointerCoords();
+            coords[0].x = x;
+            coords[0].y = y;
+            coords[0].pressure = 1.0f;
+            coords[0].size = 1.0f;
+
+            MotionEvent hover = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_HOVER_MOVE, 1, props, coords,
+                    0, 0, 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_MOUSE, 0);
+            injectEvent(hover);
+            hover.recycle();
+
+            MotionEvent down = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, 1, props, coords,
+                    0, MotionEvent.BUTTON_PRIMARY, 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_MOUSE, 0);
+            injectEvent(down);
+            down.recycle();
+
+            try { Thread.sleep(22); } catch (InterruptedException ignored) {}
+
+            long upTime = SystemClock.uptimeMillis();
+            coords[0].pressure = 0.0f;
+            MotionEvent up = MotionEvent.obtain(downTime, upTime, MotionEvent.ACTION_UP, 1, props, coords,
+                    0, 0, 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_MOUSE, 0);
+            injectEvent(up);
+            up.recycle();
+        } catch (Throwable t) {
+            injectTap(x, y, 30);
+        }
+    }
+
+    private static void injectMouseWheelOnly(float x, float y, float dx, float dy) {
+        try {
+            long now = SystemClock.uptimeMillis();
+            MotionEvent.PointerProperties[] props = new MotionEvent.PointerProperties[1];
+            props[0] = new MotionEvent.PointerProperties();
+            props[0].id = 0;
+            props[0].toolType = MotionEvent.TOOL_TYPE_MOUSE;
+
+            MotionEvent.PointerCoords[] coords = new MotionEvent.PointerCoords[1];
+            coords[0] = new MotionEvent.PointerCoords();
+            coords[0].x = x;
+            coords[0].y = y;
+            coords[0].pressure = 0.0f;
+            coords[0].size = 1.0f;
+            // Smooth multi-tick PC wheel scrolling
+            coords[0].setAxisValue(MotionEvent.AXIS_VSCROLL, Math.max(-5.0f, Math.min(5.0f, dy / 24.0f)));
+            coords[0].setAxisValue(MotionEvent.AXIS_HSCROLL, Math.max(-5.0f, Math.min(5.0f, -dx / 24.0f)));
+
+            MotionEvent wheel = MotionEvent.obtain(now, now, MotionEvent.ACTION_SCROLL, 1, props, coords,
+                    0, 0, 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_MOUSE, 0);
+            injectEvent(wheel);
+            wheel.recycle();
+        } catch (Throwable ignored) {}
     }
 
     private static void injectTap(float x, float y, long durationMs) {
