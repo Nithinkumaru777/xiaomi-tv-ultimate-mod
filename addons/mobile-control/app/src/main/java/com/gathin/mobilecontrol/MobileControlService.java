@@ -3,6 +3,7 @@ package com.gathin.mobilecontrol;
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
 import android.animation.ValueAnimator;
+import android.app.SearchManager;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -34,10 +35,12 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.Inet4Address;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URLDecoder;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Enumeration;
@@ -45,6 +48,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class MobileControlService extends AccessibilityService {
@@ -53,6 +58,7 @@ public class MobileControlService extends AccessibilityService {
     public static volatile MobileControlService sInstance;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final ExecutorService bgPool = Executors.newCachedThreadPool();
     private WindowManager windowManager;
     private CursorView cursorView;
     private WindowManager.LayoutParams cursorParams;
@@ -62,11 +68,14 @@ public class MobileControlService extends AccessibilityService {
     private float cursorY = 360f;
     private boolean cursorAdded = false;
     private volatile boolean remoteMode = false;
+    private volatile String activePackage = "";
 
     private final AtomicInteger kbSeq = new AtomicInteger(0);
     private volatile boolean editableNow = false;
     private long lastKbTriggerMs = 0L;
     private final Rect lastRemoteFocusRect = new Rect();
+    private float scrollAccumX = 0f;
+    private float scrollAccumY = 0f;
 
     private ServerSocket serverSocket;
     private volatile boolean running = false;
@@ -101,6 +110,13 @@ public class MobileControlService extends AccessibilityService {
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
         if (event == null) return;
+        CharSequence evPkg = event.getPackageName();
+        if (evPkg != null && evPkg.length() > 0) {
+            String p = evPkg.toString();
+            if (!"com.gathin.mobilecontrol".equals(p) && !"com.android.systemui".equals(p)) {
+                activePackage = p;
+            }
+        }
         int type = event.getEventType();
         if (type == AccessibilityEvent.TYPE_VIEW_FOCUSED
                 || type == AccessibilityEvent.TYPE_VIEW_CLICKED
@@ -122,10 +138,50 @@ public class MobileControlService extends AccessibilityService {
     public void onInterrupt() {
     }
 
+    private String getForegroundPackage() {
+        try {
+            AccessibilityNodeInfo root = getRootInActiveWindow();
+            if (root != null) {
+                CharSequence p = root.getPackageName();
+                root.recycle();
+                if (p != null && p.length() > 0) {
+                    activePackage = p.toString();
+                    return activePackage;
+                }
+            }
+        } catch (Exception ignored) {}
+        return activePackage != null ? activePackage : "";
+    }
+
+    private boolean isDpadFirstTvApp(String pkg) {
+        if (pkg == null) return false;
+        return pkg.equals("com.google.android.youtube.tv")
+                || pkg.equals("org.smarttube.stable")
+                || pkg.equals("com.netflix.ninja")
+                || pkg.equals("com.amazon.amazonvideo.livingroom")
+                || pkg.equals("in.startv.hotstar")
+                || pkg.equals("com.gathin.tvhome");
+    }
+
+    private boolean sendDaemonCmd(String cmdLine) {
+        try (Socket s = new Socket()) {
+            s.connect(new InetSocketAddress("127.0.0.1", ShellInputDaemon.DAEMON_PORT), 120);
+            s.setSoTimeout(400);
+            OutputStream out = s.getOutputStream();
+            out.write((cmdLine + "\n").getBytes(StandardCharsets.UTF_8));
+            out.flush();
+            BufferedReader br = new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
+            String resp = br.readLine();
+            return resp != null && resp.startsWith("OK");
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     private void triggerKeyboardPopup() {
         long now = System.currentTimeMillis();
         editableNow = true;
-        if (now - lastKbTriggerMs > 650) {
+        if (now - lastKbTriggerMs > 600) {
             lastKbTriggerMs = now;
             kbSeq.incrementAndGet();
         }
@@ -301,6 +357,7 @@ public class MobileControlService extends AccessibilityService {
 
     private void clickAtCursor(boolean longPress) {
         remoteMode = false;
+        final String fg = getForegroundPackage();
         mainHandler.post(() -> {
             if (cursorView != null) {
                 showCursorAndScheduleHide();
@@ -309,7 +366,6 @@ public class MobileControlService extends AccessibilityService {
             final int tapX = (int) cursorX;
             final int tapY = (int) cursorY;
 
-            // Pre-check if the user clicked directly on a Search button or EditText
             try {
                 AccessibilityNodeInfo root = getRootInActiveWindow();
                 if (root != null) {
@@ -331,14 +387,32 @@ public class MobileControlService extends AccessibilityService {
             } catch (Exception ignored) {
             }
 
-            try {
-                Path path = new Path();
-                path.moveTo(cursorX, cursorY);
-                GestureDescription.Builder builder = new GestureDescription.Builder();
-                builder.addStroke(new GestureDescription.StrokeDescription(path, 0, longPress ? 520 : 42));
-                dispatchGesture(builder.build(), null, null);
-            } catch (Exception ignored) {
-            }
+            bgPool.execute(() -> {
+                // In YouTube TV (Cobalt OpenGL SurfaceView), touch taps at (x,y) are ignored by the video grid;
+                // send both TAP and KEYCODE_DPAD_CENTER (23) so clicking on Trackpad works inside YouTube!
+                if ("com.google.android.youtube.tv".equals(fg)) {
+                    if (!sendDaemonCmd("KEY " + (longPress ? KeyEvent.KEYCODE_MENU : KeyEvent.KEYCODE_DPAD_CENTER))) {
+                        performRemoteOk();
+                    }
+                    // Check if YouTube search resides in top-left area
+                    if (tapX < 280 && tapY < 220) {
+                        triggerKeyboardPopup();
+                    }
+                    return;
+                }
+                String cmd = (longPress ? "LONGTAP " : "TAP ") + tapX + " " + tapY;
+                if (!sendDaemonCmd(cmd)) {
+                    mainHandler.post(() -> {
+                        try {
+                            Path path = new Path();
+                            path.moveTo(tapX, tapY);
+                            GestureDescription.Builder builder = new GestureDescription.Builder();
+                            builder.addStroke(new GestureDescription.StrokeDescription(path, 0, longPress ? 520 : 42));
+                            dispatchGesture(builder.build(), null, null);
+                        } catch (Exception ignored) {}
+                    });
+                }
+            });
 
             mainHandler.postDelayed(() -> checkActiveWindowForEditable(true), 220);
             mainHandler.postDelayed(() -> checkActiveWindowForEditable(false), 520);
@@ -346,29 +420,92 @@ public class MobileControlService extends AccessibilityService {
     }
 
     private void scrollAtCursor(float dx, float dy) {
-        mainHandler.post(() -> {
-            try {
-                float cx = remoteMode ? (screenW / 2f) : cursorX;
-                float cy = remoteMode ? (screenH / 2f) : cursorY;
-                float startX = Math.max(80f, Math.min(screenW - 80f, cx));
-                float startY = Math.max(80f, Math.min(screenH - 80f, cy));
-                float endX = Math.max(30f, Math.min(screenW - 30f, startX + dx));
-                float endY = Math.max(30f, Math.min(screenH - 30f, startY + dy));
-                if (Math.abs(endX - startX) < 4f && Math.abs(endY - startY) < 4f) return;
-                Path path = new Path();
-                path.moveTo(startX, startY);
-                path.lineTo(endX, endY);
-                GestureDescription.Builder builder = new GestureDescription.Builder();
-                builder.addStroke(new GestureDescription.StrokeDescription(path, 0, 150));
-                dispatchGesture(builder.build(), null, null);
-            } catch (Exception ignored) {
+        final String fg = getForegroundPackage();
+        final float cx = remoteMode ? (screenW / 2f) : cursorX;
+        final float cy = remoteMode ? (screenH / 2f) : cursorY;
+
+        bgPool.execute(() -> {
+            // For D-Pad-first TV apps (YouTube, SmartTube, Netflix, Prime Video, Hotstar, Home Launcher),
+            // convert 2-finger Trackpad scrolling into crisp, responsive D-Pad steps!
+            if (isDpadFirstTvApp(fg)) {
+                scrollAccumX += dx;
+                scrollAccumY += dy;
+                float stepThreshold = 42f;
+                while (Math.abs(scrollAccumY) >= stepThreshold) {
+                    if (scrollAccumY > 0) {
+                        // Two fingers moved down -> scroll up
+                        dispatchKeyFast("UP", KeyEvent.KEYCODE_DPAD_UP);
+                        scrollAccumY -= stepThreshold;
+                    } else {
+                        // Two fingers moved up -> scroll down
+                        dispatchKeyFast("DOWN", KeyEvent.KEYCODE_DPAD_DOWN);
+                        scrollAccumY += stepThreshold;
+                    }
+                }
+                while (Math.abs(scrollAccumX) >= stepThreshold) {
+                    if (scrollAccumX > 0) {
+                        dispatchKeyFast("LEFT", KeyEvent.KEYCODE_DPAD_LEFT);
+                        scrollAccumX -= stepThreshold;
+                    } else {
+                        dispatchKeyFast("RIGHT", KeyEvent.KEYCODE_DPAD_RIGHT);
+                        scrollAccumX += stepThreshold;
+                    }
+                }
+                return;
             }
+
+            // For standard Android apps & browsers (Brave Browser, Settings, Play Store):
+            // Inject high-sensitivity Mouse Wheel + Touchscreen Drag via ShellInputDaemon
+            float startX = Math.max(80f, Math.min(screenW - 80f, cx));
+            float startY = Math.max(80f, Math.min(screenH - 80f, cy));
+            float clampedDx = Math.max(-520f, Math.min(520f, dx));
+            float clampedDy = Math.max(-520f, Math.min(520f, dy));
+            if (sendDaemonCmd("SCROLL " + (int) startX + " " + (int) startY + " " + (int) clampedDx + " " + (int) clampedDy)) {
+                return;
+            }
+            mainHandler.post(() -> {
+                try {
+                    float endX = Math.max(30f, Math.min(screenW - 30f, startX + clampedDx));
+                    float endY = Math.max(30f, Math.min(screenH - 30f, startY + clampedDy));
+                    if (Math.abs(endX - startX) < 4f && Math.abs(endY - startY) < 4f) return;
+                    Path path = new Path();
+                    path.moveTo(startX, startY);
+                    path.lineTo(endX, endY);
+                    GestureDescription.Builder builder = new GestureDescription.Builder();
+                    builder.addStroke(new GestureDescription.StrokeDescription(path, 0, 125));
+                    dispatchGesture(builder.build(), null, null);
+                } catch (Exception ignored) {}
+            });
         });
     }
 
-    private void injectText(String text, boolean submit) {
+    private void injectTextAndSubmit(String text, boolean submit) {
         if (text == null) return;
+        final String fg = getForegroundPackage();
+        final String clean = text.trim();
+
+        // When the user taps "Search" on the Mobile Keyboard:
+        // Execute the search immediately in YouTube, SmartTube, Brave, or any focused input!
+        if (submit && !clean.isEmpty()) {
+            if ("com.google.android.youtube.tv".equals(fg)) {
+                launchDirectSearch("com.google.android.youtube.tv", clean);
+                return;
+            } else if ("org.smarttube.stable".equals(fg)) {
+                launchDirectSearch("org.smarttube.stable", clean);
+                return;
+            } else if ("com.gathin.tvhome".equals(fg)) {
+                // On the Home screen: if it looks like a URL, open in Brave; otherwise search YouTube!
+                if (clean.contains(".") && !clean.contains(" ")) {
+                    openUrlInBrave(clean);
+                } else {
+                    launchDirectSearch("com.google.android.youtube.tv", clean);
+                }
+                return;
+            }
+        }
+
         mainHandler.post(() -> {
+            boolean setViaAccessibility = false;
             try {
                 if (!text.isEmpty()) {
                     ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
@@ -392,8 +529,9 @@ public class MobileControlService extends AccessibilityService {
                     target.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
                     Bundle b = new Bundle();
                     b.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text);
-                    if (!target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, b) && !text.isEmpty()) {
-                        target.performAction(AccessibilityNodeInfo.ACTION_PASTE);
+                    setViaAccessibility = target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, b);
+                    if (!setViaAccessibility && !text.isEmpty()) {
+                        setViaAccessibility = target.performAction(AccessibilityNodeInfo.ACTION_PASTE);
                     }
                     if (submit) {
                         if (Build.VERSION.SDK_INT >= 30) {
@@ -402,11 +540,47 @@ public class MobileControlService extends AccessibilityService {
                         target.performAction(AccessibilityNodeInfo.ACTION_CLICK);
                     }
                     target.recycle();
-                } else if (submit && !text.trim().isEmpty()) {
-                    openUrlInBrave(text.trim());
                 }
             } catch (Exception ignored) {
             }
+
+            final boolean wasSet = setViaAccessibility;
+            if (submit) {
+                bgPool.execute(() -> {
+                    if (!wasSet && "com.brave.browser".equals(fg) && !clean.isEmpty()) {
+                        openUrlInBrave(clean);
+                        return;
+                    }
+                    if (!wasSet && !clean.isEmpty()) {
+                        try {
+                            sendDaemonCmd("TEXT " + URLEncoder.encode(clean, "UTF-8"));
+                        } catch (Exception ignored) {}
+                    }
+                    // Press hardware ENTER (66) so the app executes the search immediately without manual clicking!
+                    sendDaemonCmd("KEY " + KeyEvent.KEYCODE_ENTER);
+                });
+            }
+        });
+    }
+
+    private void launchDirectSearch(String pkg, String query) {
+        mainHandler.post(() -> {
+            try {
+                Intent searchIntent = new Intent(Intent.ACTION_SEARCH);
+                searchIntent.setPackage(pkg);
+                searchIntent.putExtra(SearchManager.QUERY, query);
+                searchIntent.putExtra("query", query);
+                searchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                startActivity(searchIntent);
+                return;
+            } catch (Exception ignored) {}
+            try {
+                Uri uri = Uri.parse("https://www.youtube.com/results?search_query=" + Uri.encode(query));
+                Intent viewIntent = new Intent(Intent.ACTION_VIEW, uri);
+                viewIntent.setPackage(pkg);
+                viewIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(viewIntent);
+            } catch (Exception ignored) {}
         });
     }
 
@@ -455,22 +629,55 @@ public class MobileControlService extends AccessibilityService {
         });
     }
 
+    private void dispatchKeyFast(String keyName, int keyCode) {
+        String fg = getForegroundPackage();
+        if ("com.gathin.tvhome".equals(fg) && ("UP".equals(keyName) || "DOWN".equals(keyName)
+                || "LEFT".equals(keyName) || "RIGHT".equals(keyName) || "OK".equals(keyName))) {
+            try {
+                Intent b = new Intent("com.gathin.tvhome.REMOTE_KEY");
+                b.setPackage("com.gathin.tvhome");
+                b.putExtra("key", keyName);
+                sendBroadcast(b);
+                return;
+            } catch (Exception ignored) {}
+        }
+        if (sendDaemonCmd("KEY " + keyCode)) {
+            return;
+        }
+        // Fallback if ShellInputDaemon is not running
+        mainHandler.post(() -> {
+            if ("OK".equals(keyName)) {
+                performRemoteOk();
+            } else if ("UP".equals(keyName)) {
+                performRemoteDirection(View.FOCUS_UP, "UP", 0, 220);
+            } else if ("DOWN".equals(keyName)) {
+                performRemoteDirection(View.FOCUS_DOWN, "DOWN", 0, -220);
+            } else if ("LEFT".equals(keyName)) {
+                performRemoteDirection(View.FOCUS_LEFT, "LEFT", 220, 0);
+            } else if ("RIGHT".equals(keyName)) {
+                performRemoteDirection(View.FOCUS_RIGHT, "RIGHT", -220, 0);
+            }
+        });
+    }
+
     private void handleKeyAction(String key) {
         if (key == null) return;
         remoteMode = true;
         hideCursorNow();
-        mainHandler.post(() -> {
+        bgPool.execute(() -> {
             try {
                 AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
                 switch (key) {
                     case "BACK":
-                        performGlobalAction(GLOBAL_ACTION_BACK);
+                        if (!sendDaemonCmd("KEY " + KeyEvent.KEYCODE_BACK)) {
+                            mainHandler.post(() -> performGlobalAction(GLOBAL_ACTION_BACK));
+                        }
                         break;
                     case "HOME":
-                        performGlobalAction(GLOBAL_ACTION_HOME);
+                        mainHandler.post(() -> performGlobalAction(GLOBAL_ACTION_HOME));
                         break;
                     case "RECENTS":
-                        performGlobalAction(GLOBAL_ACTION_RECENTS);
+                        mainHandler.post(() -> performGlobalAction(GLOBAL_ACTION_RECENTS));
                         break;
                     case "VOL_UP":
                         if (am != null) am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI);
@@ -482,25 +689,26 @@ public class MobileControlService extends AccessibilityService {
                         if (am != null) am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_TOGGLE_MUTE, AudioManager.FLAG_SHOW_UI);
                         break;
                     case "PLAY_PAUSE":
-                        if (am != null) {
+                        if (!sendDaemonCmd("KEY " + KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE) && am != null) {
                             am.dispatchMediaKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE));
                             am.dispatchMediaKeyEvent(new KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE));
                         }
                         break;
                     case "OK":
-                        performRemoteOk();
+                        dispatchKeyFast("OK", KeyEvent.KEYCODE_DPAD_CENTER);
+                        mainHandler.postDelayed(() -> checkActiveWindowForEditable(true), 220);
                         break;
                     case "UP":
-                        performRemoteDirection(View.FOCUS_UP, "UP", 0, 220);
+                        dispatchKeyFast("UP", KeyEvent.KEYCODE_DPAD_UP);
                         break;
                     case "DOWN":
-                        performRemoteDirection(View.FOCUS_DOWN, "DOWN", 0, -220);
+                        dispatchKeyFast("DOWN", KeyEvent.KEYCODE_DPAD_DOWN);
                         break;
                     case "LEFT":
-                        performRemoteDirection(View.FOCUS_LEFT, "LEFT", 220, 0);
+                        dispatchKeyFast("LEFT", KeyEvent.KEYCODE_DPAD_LEFT);
                         break;
                     case "RIGHT":
-                        performRemoteDirection(View.FOCUS_RIGHT, "RIGHT", -220, 0);
+                        dispatchKeyFast("RIGHT", KeyEvent.KEYCODE_DPAD_RIGHT);
                         break;
                 }
             } catch (Exception ignored) {
@@ -509,7 +717,6 @@ public class MobileControlService extends AccessibilityService {
     }
 
     private void performRemoteDirection(int focusDir, String keyName, float swipeDx, float swipeDy) {
-        // 1. Send direct broadcast to our Launcher (works even in Touch Mode!)
         try {
             Intent b = new Intent("com.gathin.tvhome.REMOTE_KEY");
             b.setPackage("com.gathin.tvhome");
@@ -527,7 +734,6 @@ public class MobileControlService extends AccessibilityService {
             }
         }
 
-        // 2. For all other apps: try focusSearch or spatial 2D focus navigation
         try {
             AccessibilityNodeInfo current = findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
             if (current == null) {
@@ -572,13 +778,9 @@ public class MobileControlService extends AccessibilityService {
             }
         } catch (Exception ignored) {
         }
-        if (swipeDy != 0 || swipeDx != 0) {
-            scrollAtCursor(swipeDx, swipeDy);
-        }
     }
 
     private void performRemoteOk() {
-        // 1. Send direct broadcast to our Launcher
         try {
             Intent b = new Intent("com.gathin.tvhome.REMOTE_KEY");
             b.setPackage("com.gathin.tvhome");
@@ -596,7 +798,6 @@ public class MobileControlService extends AccessibilityService {
             }
         }
 
-        // 2. For all other apps: click focused node (NEVER click the mouse cursor!)
         try {
             AccessibilityNodeInfo f = findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
             if (f == null) f = findFocus(AccessibilityNodeInfo.FOCUS_ACCESSIBILITY);
@@ -756,9 +957,9 @@ public class MobileControlService extends AccessibilityService {
                 } else if ("key".equals(cmd)) {
                     handleKeyAction(q.get("val"));
                 } else if ("text".equals(cmd)) {
-                    injectText(q.get("val"), false);
+                    injectTextAndSubmit(q.get("val"), false);
                 } else if ("submit".equals(cmd)) {
-                    injectText(q.get("val"), true);
+                    injectTextAndSubmit(q.get("val"), true);
                 } else if ("url".equals(cmd)) {
                     openUrlInBrave(q.get("val"));
                 } else if ("app".equals(cmd)) {
@@ -828,10 +1029,6 @@ public class MobileControlService extends AccessibilityService {
         return "192.168.0.233";
     }
 
-    /**
-     * Premium macOS Sonoma / Apple VisionOS inspired fluid pointer with diffused drop shadow,
-     * obsidian glass core, pearl-white rim, cyan tip glow, and radial click pulse animation.
-     */
     private static final class CursorView extends View {
         private final Paint shadowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint bodyPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -864,7 +1061,6 @@ public class MobileControlService extends AccessibilityService {
             pulsePaint.setStyle(Paint.Style.STROKE);
             pulsePaint.setStrokeWidth(2.2f);
 
-            // Sleek macOS / VisionOS rounded arrow geometry
             pointerPath.moveTo(5f, 4f);
             pointerPath.lineTo(5f, 31f);
             pointerPath.lineTo(12.2f, 24.2f);
@@ -907,9 +1103,7 @@ public class MobileControlService extends AccessibilityService {
     private static final String WEB_UI_HTML =
         "<!DOCTYPE html><html><head><meta charset='utf-8'>" +
         "<meta name='viewport' content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>" +
-        "<title>MiTV Studio Remote</title>" +
-        "<style>" +
-        "*{box-sizing:border-box;-webkit-user-select:none;user-select:none;touch-action:manipulation;}" +
-        "body{margin:0;background:#05070E;color:#F8FAFC;font-family:-apple-system,BlinkMacSystemFont,'Inter',sans-serif;display:flex;flex-direction:column;height:100vh;overflow:hidden;}" +
-        "</style></head><body><h2 style='padding:20px;color:#38BDF8'>MiTV Control Server v2.0 Active</h2></body></html>";
+        "<title>MiTV Studio Remote v3.0</title>" +
+        "<style>body{margin:0;background:#05070E;color:#F8FAFC;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;}</style>" +
+        "</head><body><h2 style='color:#38BDF8'>MiTV Control Server v3.0 Active</h2></body></html>";
 }
