@@ -358,8 +358,8 @@ public class MobileControlService extends AccessibilityService {
                 if (Math.abs(dy) >= Math.abs(dx) * 1.15f) {
                     padMoveAccumX = 0f;
                     padMoveAccumY += dy;
-                    if (Math.abs(padMoveAccumY) >= 46f) {
-                        if (now - lastDpadStepMs >= 65) {
+                    if (Math.abs(padMoveAccumY) >= 62f) {
+                        if (now - lastDpadStepMs >= 85) {
                             lastDpadStepMs = now;
                             if (padMoveAccumY > 0) {
                                 dispatchKeyFast("DOWN", KeyEvent.KEYCODE_DPAD_DOWN);
@@ -372,8 +372,8 @@ public class MobileControlService extends AccessibilityService {
                 } else if (Math.abs(dx) > Math.abs(dy) * 1.15f) {
                     padMoveAccumY = 0f;
                     padMoveAccumX += dx;
-                    if (Math.abs(padMoveAccumX) >= 46f) {
-                        if (now - lastDpadStepMs >= 65) {
+                    if (Math.abs(padMoveAccumX) >= 62f) {
+                        if (now - lastDpadStepMs >= 85) {
                             lastDpadStepMs = now;
                             if (padMoveAccumX > 0) {
                                 dispatchKeyFast("RIGHT", KeyEvent.KEYCODE_DPAD_RIGHT);
@@ -474,16 +474,16 @@ public class MobileControlService extends AccessibilityService {
         final float cy = remoteMode ? (screenH / 2f) : cursorY;
 
         bgPool.execute(() -> {
-            // For TV highlight apps (YouTube, SmartTube, Netflix, Prime Video, Hotstar, Home Launcher),
-            // convert 2-finger Trackpad scrolling into single-axis, non-flooding D-Pad steps!
+            // For TV highlight apps (YouTube, Netflix, Prime Video, Hotstar, Home Launcher),
+            // convert 2-finger Trackpad scrolling into single-axis, normal-sensitivity D-Pad steps!
             if (isDpadFirstTvApp(fg)) {
                 hideCursorNow();
                 long now = System.currentTimeMillis();
                 if (Math.abs(dy) >= Math.abs(dx) * 1.15f) {
                     scrollAccumX = 0f;
                     scrollAccumY += dy;
-                    if (Math.abs(scrollAccumY) >= 38f) {
-                        if (now - lastDpadStepMs >= 50) {
+                    if (Math.abs(scrollAccumY) >= 58f) {
+                        if (now - lastDpadStepMs >= 78) {
                             lastDpadStepMs = now;
                             if (scrollAccumY > 0) {
                                 dispatchKeyFast("UP", KeyEvent.KEYCODE_DPAD_UP);
@@ -496,8 +496,8 @@ public class MobileControlService extends AccessibilityService {
                 } else if (Math.abs(dx) > Math.abs(dy) * 1.15f) {
                     scrollAccumY = 0f;
                     scrollAccumX += dx;
-                    if (Math.abs(scrollAccumX) >= 38f) {
-                        if (now - lastDpadStepMs >= 50) {
+                    if (Math.abs(scrollAccumX) >= 58f) {
+                        if (now - lastDpadStepMs >= 78) {
                             lastDpadStepMs = now;
                             if (scrollAccumX > 0) {
                                 dispatchKeyFast("LEFT", KeyEvent.KEYCODE_DPAD_LEFT);

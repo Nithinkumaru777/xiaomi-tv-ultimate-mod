@@ -361,14 +361,104 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     };
     // Right after boot the clock is often wrong until network time arrives; don't wait a minute to catch up.
     private final IntentFilter timeFilter = new IntentFilter(Intent.ACTION_TIME_CHANGED);
+    private View activeTopPill = null;
+    private int activePopupRow = 0;
+
+    private List<View> getVisibleTopBarPills() {
+        List<View> list = new ArrayList<>();
+        View settings = findViewById(R.id.btnSettings);
+        View[] candidates = new View[]{btnInputs, btnWifi, btnVpn, btnReorder, btnLibraryTop, settings};
+        for (View v : candidates) {
+            if (v != null && v.getVisibility() == View.VISIBLE) {
+                list.add(v);
+            }
+        }
+        return list;
+    }
+
+    private void focusTopPill(View pill) {
+        if (pill == null) return;
+        activeTopPill = pill;
+        hideGlass();
+        boolean ok = pill.requestFocus();
+        if (!ok) {
+            pill.setFocusableInTouchMode(true);
+            pill.requestFocus();
+            pill.setFocusableInTouchMode(false);
+        }
+    }
+
     private final IntentFilter remoteFilter = new IntentFilter("com.gathin.tvhome.REMOTE_KEY");
     private final BroadcastReceiver remoteReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            if (!hasWindowFocus() || isFinishing() || adapter == null) return;
+            if (isFinishing() || adapter == null) return;
             String key = intent.getStringExtra("key");
             if (key == null) return;
             restartIdleClock();
+
+            // 1. If a dropdown popup (HDMI Inputs or Settings menu) is open, navigate & click inside it!
+            if (openPopup != null && openPopup.isShowing() && openPopup.getContentView() != null) {
+                LinearLayout rows = openPopup.getContentView().findViewById(R.id.rows);
+                if (rows != null && rows.getChildCount() > 0) {
+                    List<View> focusableRows = new ArrayList<>();
+                    for (int i = 0; i < rows.getChildCount(); i++) {
+                        View r = rows.getChildAt(i);
+                        if (r != null && r.isClickable()) focusableRows.add(r);
+                    }
+                    if (!focusableRows.isEmpty()) {
+                        activePopupRow = Math.max(0, Math.min(activePopupRow, focusableRows.size() - 1));
+                        if ("UP".equals(key)) {
+                            activePopupRow = Math.max(0, activePopupRow - 1);
+                            View target = focusableRows.get(activePopupRow);
+                            target.setFocusableInTouchMode(true);
+                            target.requestFocus();
+                            target.setFocusableInTouchMode(false);
+                        } else if ("DOWN".equals(key)) {
+                            activePopupRow = Math.min(focusableRows.size() - 1, activePopupRow + 1);
+                            View target = focusableRows.get(activePopupRow);
+                            target.setFocusableInTouchMode(true);
+                            target.requestFocus();
+                            target.setFocusableInTouchMode(false);
+                        } else if ("OK".equals(key)) {
+                            focusableRows.get(activePopupRow).performClick();
+                        }
+                        return;
+                    }
+                }
+            } else {
+                activePopupRow = 0;
+            }
+
+            // 2. Check if focus is currently in the Top Bar (HDMI Inputs, Wi-Fi, Settings)
+            List<View> topPills = getVisibleTopBarPills();
+            View currentFocus = getCurrentFocus();
+            if (currentFocus != null && topPills.contains(currentFocus)) {
+                activeTopPill = currentFocus;
+            }
+            if (activeTopPill != null && topPills.contains(activeTopPill)) {
+                int idx = topPills.indexOf(activeTopPill);
+                switch (key) {
+                    case "LEFT":
+                        if (idx > 0) focusTopPill(topPills.get(idx - 1));
+                        return;
+                    case "RIGHT":
+                        if (idx + 1 < topPills.size()) focusTopPill(topPills.get(idx + 1));
+                        return;
+                    case "UP":
+                        return;
+                    case "DOWN":
+                        activeTopPill = null;
+                        focusTile(singleRow ? lastFocused : lastFocused % COLUMNS);
+                        return;
+                    case "OK":
+                        activePopupRow = 0;
+                        activeTopPill.performClick();
+                        return;
+                }
+            }
+
+            // 3. Otherwise navigate the App Grid
             int count = adapter.appCount();
             if (count <= 0) return;
             int cur = Math.max(0, Math.min(lastFocused, count - 1));
@@ -380,14 +470,27 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
                     if (cur + 1 < count) focusTile(cur + 1);
                     break;
                 case "UP":
-                    if (cur >= COLUMNS) focusTile(cur - COLUMNS);
-                    else firstTopButton().requestFocus();
+                    if (cur >= COLUMNS) {
+                        focusTile(cur - COLUMNS);
+                    } else if (!topPills.isEmpty()) {
+                        // Map column position naturally to HDMI / Wi-Fi / Settings in the top bar
+                        int col = cur % COLUMNS;
+                        int pillIdx;
+                        if (col == 0) pillIdx = 0;
+                        else if (col >= COLUMNS - 1) pillIdx = topPills.size() - 1;
+                        else pillIdx = Math.min(1, topPills.size() - 1);
+                        focusTopPill(topPills.get(pillIdx));
+                    }
                     break;
                 case "DOWN":
                     if (cur + COLUMNS < count) focusTile(cur + COLUMNS);
                     else if (cur < count - 1) focusTile(count - 1);
                     break;
                 case "OK":
+                    if (currentFocus != null && topPills.contains(currentFocus)) {
+                        currentFocus.performClick();
+                        return;
+                    }
                     RecyclerView.ViewHolder vh = grid.findViewHolderForAdapterPosition(cur);
                     if (vh != null) {
                         View card = vh.itemView.findViewById(R.id.card);
@@ -396,8 +499,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
                             return;
                         }
                     }
-                    View focused = getCurrentFocus();
-                    if (focused != null && focused != grid) focused.performClick();
+                    if (currentFocus != null && currentFocus != grid) currentFocus.performClick();
                     break;
             }
         }
