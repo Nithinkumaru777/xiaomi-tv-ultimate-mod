@@ -76,6 +76,9 @@ public class MobileControlService extends AccessibilityService {
     private final Rect lastRemoteFocusRect = new Rect();
     private float scrollAccumX = 0f;
     private float scrollAccumY = 0f;
+    private float padMoveAccumX = 0f;
+    private float padMoveAccumY = 0f;
+    private long lastDpadStepMs = 0L;
 
     private ServerSocket serverSocket;
     private volatile boolean running = false;
@@ -113,24 +116,26 @@ public class MobileControlService extends AccessibilityService {
         CharSequence evPkg = event.getPackageName();
         if (evPkg != null && evPkg.length() > 0) {
             String p = evPkg.toString();
-            if (!"com.gathin.mobilecontrol".equals(p) && !"com.android.systemui".equals(p)) {
+            if (!"com.gathin.mobilecontrol".equals(p)
+                    && !"com.android.systemui".equals(p)
+                    && !"android".equals(p)) {
                 activePackage = p;
+                if (isDpadFirstTvApp(p)) {
+                    hideCursorNow();
+                }
             }
         }
-        int type = event.getEventType();
-        if (type == AccessibilityEvent.TYPE_VIEW_FOCUSED
-                || type == AccessibilityEvent.TYPE_VIEW_CLICKED
-                || type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+        // Never auto-pop the mobile keyboard from background TV focus events;
+        // only auto-pop when the user clicks an actual EditText inside a Browser/Touch app.
+        if (!isDpadFirstTvApp(activePackage) && event.getEventType() == AccessibilityEvent.TYPE_VIEW_CLICKED) {
             AccessibilityNodeInfo src = event.getSource();
             if (src != null) {
-                boolean isEdit = isNodeEditableOrSearch(src, type == AccessibilityEvent.TYPE_VIEW_CLICKED);
+                boolean isEdit = src.isEditable();
                 src.recycle();
                 if (isEdit) {
                     triggerKeyboardPopup();
-                    return;
                 }
             }
-            checkActiveWindowForEditable(false);
         }
     }
 
@@ -145,22 +150,30 @@ public class MobileControlService extends AccessibilityService {
                 CharSequence p = root.getPackageName();
                 root.recycle();
                 if (p != null && p.length() > 0) {
-                    activePackage = p.toString();
-                    return activePackage;
+                    String pkg = p.toString();
+                    if (!"com.gathin.mobilecontrol".equals(pkg)
+                            && !"com.android.systemui".equals(pkg)
+                            && !"android".equals(pkg)) {
+                        activePackage = pkg;
+                        return activePackage;
+                    }
                 }
             }
         } catch (Exception ignored) {}
         return activePackage != null ? activePackage : "";
     }
 
+    private boolean isBrowserOrTouchApp(String pkg) {
+        if (pkg == null || pkg.isEmpty()) return false;
+        String lower = pkg.toLowerCase(Locale.US);
+        return lower.equals("com.brave.browser")
+                || lower.contains("browser")
+                || lower.contains("chrome")
+                || lower.contains("firefox");
+    }
+
     private boolean isDpadFirstTvApp(String pkg) {
-        if (pkg == null) return false;
-        return pkg.equals("com.google.android.youtube.tv")
-                || pkg.equals("org.smarttube.stable")
-                || pkg.equals("com.netflix.ninja")
-                || pkg.equals("com.amazon.amazonvideo.livingroom")
-                || pkg.equals("in.startv.hotstar")
-                || pkg.equals("com.gathin.tvhome");
+        return !isBrowserOrTouchApp(pkg);
     }
 
     private boolean sendDaemonCmd(String cmdLine) {
@@ -337,6 +350,44 @@ public class MobileControlService extends AccessibilityService {
     }
 
     private void moveCursor(float dx, float dy) {
+        final String fg = getForegroundPackage();
+        if (isDpadFirstTvApp(fg)) {
+            hideCursorNow();
+            bgPool.execute(() -> {
+                long now = System.currentTimeMillis();
+                if (Math.abs(dy) >= Math.abs(dx) * 1.15f) {
+                    padMoveAccumX = 0f;
+                    padMoveAccumY += dy;
+                    if (Math.abs(padMoveAccumY) >= 46f) {
+                        if (now - lastDpadStepMs >= 65) {
+                            lastDpadStepMs = now;
+                            if (padMoveAccumY > 0) {
+                                dispatchKeyFast("DOWN", KeyEvent.KEYCODE_DPAD_DOWN);
+                            } else {
+                                dispatchKeyFast("UP", KeyEvent.KEYCODE_DPAD_UP);
+                            }
+                        }
+                        padMoveAccumY = 0f;
+                    }
+                } else if (Math.abs(dx) > Math.abs(dy) * 1.15f) {
+                    padMoveAccumY = 0f;
+                    padMoveAccumX += dx;
+                    if (Math.abs(padMoveAccumX) >= 46f) {
+                        if (now - lastDpadStepMs >= 65) {
+                            lastDpadStepMs = now;
+                            if (padMoveAccumX > 0) {
+                                dispatchKeyFast("RIGHT", KeyEvent.KEYCODE_DPAD_RIGHT);
+                            } else {
+                                dispatchKeyFast("LEFT", KeyEvent.KEYCODE_DPAD_LEFT);
+                            }
+                        }
+                        padMoveAccumX = 0f;
+                    }
+                }
+            });
+            return;
+        }
+
         remoteMode = false;
         mainHandler.post(() -> {
             if (!cursorAdded || cursorView == null) {
@@ -356,8 +407,26 @@ public class MobileControlService extends AccessibilityService {
     }
 
     private void clickAtCursor(boolean longPress) {
-        remoteMode = false;
         final String fg = getForegroundPackage();
+        if (isDpadFirstTvApp(fg)) {
+            hideCursorNow();
+            padMoveAccumX = 0f;
+            padMoveAccumY = 0f;
+            scrollAccumX = 0f;
+            scrollAccumY = 0f;
+            bgPool.execute(() -> {
+                if (longPress) {
+                    if (!sendDaemonCmd("KEY " + KeyEvent.KEYCODE_MENU)) {
+                        dispatchKeyFast("OK", KeyEvent.KEYCODE_DPAD_CENTER);
+                    }
+                } else {
+                    dispatchKeyFast("OK", KeyEvent.KEYCODE_DPAD_CENTER);
+                }
+            });
+            return;
+        }
+
+        remoteMode = false;
         mainHandler.post(() -> {
             if (cursorView != null) {
                 showCursorAndScheduleHide();
@@ -372,14 +441,9 @@ public class MobileControlService extends AccessibilityService {
                     AccessibilityNodeInfo hit = findDeepestNodeAt(root, tapX, tapY);
                     root.recycle();
                     if (hit != null) {
-                        boolean isSearchOrEdit = isNodeEditableOrSearch(hit, true);
-                        AccessibilityNodeInfo parent = hit.getParent();
-                        if (!isSearchOrEdit && parent != null) {
-                            isSearchOrEdit = isNodeEditableOrSearch(parent, true);
-                        }
-                        if (parent != null) parent.recycle();
+                        boolean isEdit = hit.isEditable();
                         hit.recycle();
-                        if (isSearchOrEdit) {
+                        if (isEdit) {
                             triggerKeyboardPopup();
                         }
                     }
@@ -388,18 +452,6 @@ public class MobileControlService extends AccessibilityService {
             }
 
             bgPool.execute(() -> {
-                // In YouTube TV (Cobalt OpenGL SurfaceView), touch taps at (x,y) are ignored by the video grid;
-                // send both TAP and KEYCODE_DPAD_CENTER (23) so clicking on Trackpad works inside YouTube!
-                if ("com.google.android.youtube.tv".equals(fg)) {
-                    if (!sendDaemonCmd("KEY " + (longPress ? KeyEvent.KEYCODE_MENU : KeyEvent.KEYCODE_DPAD_CENTER))) {
-                        performRemoteOk();
-                    }
-                    // Check if YouTube search resides in top-left area
-                    if (tapX < 280 && tapY < 220) {
-                        triggerKeyboardPopup();
-                    }
-                    return;
-                }
                 String cmd = (longPress ? "LONGTAP " : "TAP ") + tapX + " " + tapY;
                 if (!sendDaemonCmd(cmd)) {
                     mainHandler.post(() -> {
@@ -413,9 +465,6 @@ public class MobileControlService extends AccessibilityService {
                     });
                 }
             });
-
-            mainHandler.postDelayed(() -> checkActiveWindowForEditable(true), 220);
-            mainHandler.postDelayed(() -> checkActiveWindowForEditable(false), 520);
         });
     }
 
@@ -425,36 +474,44 @@ public class MobileControlService extends AccessibilityService {
         final float cy = remoteMode ? (screenH / 2f) : cursorY;
 
         bgPool.execute(() -> {
-            // For D-Pad-first TV apps (YouTube, SmartTube, Netflix, Prime Video, Hotstar, Home Launcher),
-            // convert 2-finger Trackpad scrolling into crisp, responsive D-Pad steps!
+            // For TV highlight apps (YouTube, SmartTube, Netflix, Prime Video, Hotstar, Home Launcher),
+            // convert 2-finger Trackpad scrolling into single-axis, non-flooding D-Pad steps!
             if (isDpadFirstTvApp(fg)) {
-                scrollAccumX += dx;
-                scrollAccumY += dy;
-                float stepThreshold = 42f;
-                while (Math.abs(scrollAccumY) >= stepThreshold) {
-                    if (scrollAccumY > 0) {
-                        // Two fingers moved down -> scroll up
-                        dispatchKeyFast("UP", KeyEvent.KEYCODE_DPAD_UP);
-                        scrollAccumY -= stepThreshold;
-                    } else {
-                        // Two fingers moved up -> scroll down
-                        dispatchKeyFast("DOWN", KeyEvent.KEYCODE_DPAD_DOWN);
-                        scrollAccumY += stepThreshold;
+                hideCursorNow();
+                long now = System.currentTimeMillis();
+                if (Math.abs(dy) >= Math.abs(dx) * 1.15f) {
+                    scrollAccumX = 0f;
+                    scrollAccumY += dy;
+                    if (Math.abs(scrollAccumY) >= 38f) {
+                        if (now - lastDpadStepMs >= 50) {
+                            lastDpadStepMs = now;
+                            if (scrollAccumY > 0) {
+                                dispatchKeyFast("UP", KeyEvent.KEYCODE_DPAD_UP);
+                            } else {
+                                dispatchKeyFast("DOWN", KeyEvent.KEYCODE_DPAD_DOWN);
+                            }
+                        }
+                        scrollAccumY = 0f;
                     }
-                }
-                while (Math.abs(scrollAccumX) >= stepThreshold) {
-                    if (scrollAccumX > 0) {
-                        dispatchKeyFast("LEFT", KeyEvent.KEYCODE_DPAD_LEFT);
-                        scrollAccumX -= stepThreshold;
-                    } else {
-                        dispatchKeyFast("RIGHT", KeyEvent.KEYCODE_DPAD_RIGHT);
-                        scrollAccumX += stepThreshold;
+                } else if (Math.abs(dx) > Math.abs(dy) * 1.15f) {
+                    scrollAccumY = 0f;
+                    scrollAccumX += dx;
+                    if (Math.abs(scrollAccumX) >= 38f) {
+                        if (now - lastDpadStepMs >= 50) {
+                            lastDpadStepMs = now;
+                            if (scrollAccumX > 0) {
+                                dispatchKeyFast("LEFT", KeyEvent.KEYCODE_DPAD_LEFT);
+                            } else {
+                                dispatchKeyFast("RIGHT", KeyEvent.KEYCODE_DPAD_RIGHT);
+                            }
+                        }
+                        scrollAccumX = 0f;
                     }
                 }
                 return;
             }
 
-            // For standard Android apps & browsers (Brave Browser, Settings, Play Store):
+            // For standard Android apps & browsers (Brave Browser):
             // Inject high-sensitivity Mouse Wheel + Touchscreen Drag via ShellInputDaemon
             float startX = Math.max(80f, Math.min(screenW - 80f, cx));
             float startY = Math.max(80f, Math.min(screenH - 80f, cy));
@@ -696,7 +753,6 @@ public class MobileControlService extends AccessibilityService {
                         break;
                     case "OK":
                         dispatchKeyFast("OK", KeyEvent.KEYCODE_DPAD_CENTER);
-                        mainHandler.postDelayed(() -> checkActiveWindowForEditable(true), 220);
                         break;
                     case "UP":
                         dispatchKeyFast("UP", KeyEvent.KEYCODE_DPAD_UP);
@@ -802,22 +858,12 @@ public class MobileControlService extends AccessibilityService {
             AccessibilityNodeInfo f = findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
             if (f == null) f = findFocus(AccessibilityNodeInfo.FOCUS_ACCESSIBILITY);
             if (f != null) {
-                boolean isSearch = isNodeEditableOrSearch(f, true);
-                Rect r = new Rect();
-                f.getBoundsInScreen(r);
-                boolean clicked = f.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                boolean isEdit = f.isEditable() && !isDpadFirstTvApp(getForegroundPackage());
+                f.performAction(AccessibilityNodeInfo.ACTION_CLICK);
                 f.recycle();
-                if (isSearch) triggerKeyboardPopup();
-                if (!clicked && !r.isEmpty()) {
-                    silentTapAt(r.centerX(), r.centerY());
-                }
+                if (isEdit) triggerKeyboardPopup();
                 if (root != null) root.recycle();
-                mainHandler.postDelayed(() -> checkActiveWindowForEditable(true), 220);
                 return;
-            }
-            if (!lastRemoteFocusRect.isEmpty()) {
-                silentTapAt(lastRemoteFocusRect.centerX(), lastRemoteFocusRect.centerY());
-                mainHandler.postDelayed(() -> checkActiveWindowForEditable(true), 220);
             }
             if (root != null) root.recycle();
         } catch (Exception ignored) {

@@ -157,7 +157,7 @@ public final class MainActivity extends Activity {
                 BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8));
                 String body = br.readLine();
                 br.close();
-                handleServerJson(targetIp, body);
+                handleServerJson(targetIp, body, false);
             }
         } catch (Throwable ignored) {
         } finally {
@@ -165,7 +165,7 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private void handleServerJson(String ip, String body) {
+    private synchronized void handleServerJson(String ip, String body, boolean allowKbPopup) {
         updateStatusUi(ip, true);
         if (body == null) return;
         int idx = body.indexOf("\"kbSeq\":");
@@ -175,8 +175,8 @@ public final class MainActivity extends Activity {
             while (end < body.length() && Character.isDigit(body.charAt(end))) end++;
             try {
                 int seq = Integer.parseInt(body.substring(start, end));
-                if (lastSeenKbSeq == -1) {
-                    lastSeenKbSeq = seq;
+                if (lastSeenKbSeq == -1 || !allowKbPopup) {
+                    if (seq > lastSeenKbSeq) lastSeenKbSeq = seq;
                 } else if (seq > lastSeenKbSeq) {
                     lastSeenKbSeq = seq;
                     triggerMobileKeyboardOverlay();
@@ -197,6 +197,7 @@ public final class MainActivity extends Activity {
 
     private void sendCmd(final String query) {
         final String targetIp = tvIp;
+        final boolean allowKb = query != null && query.startsWith("click");
         netPool.execute(() -> {
             HttpURLConnection conn = null;
             try {
@@ -210,7 +211,7 @@ public final class MainActivity extends Activity {
                     BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8));
                     String body = br.readLine();
                     br.close();
-                    handleServerJson(targetIp, body);
+                    handleServerJson(targetIp, body, allowKb);
                 }
             } catch (Throwable t) {
                 updateStatusUi(targetIp, false);
@@ -515,10 +516,10 @@ public final class MainActivity extends Activity {
             + "function closeIpModal(){document.getElementById('ipModal').style.display='none';}"
             + "function saveIpModal(){const v=document.getElementById('ipInput').value;if(v&&window.AndroidBridge)AndroidBridge.setTvIp(v);closeIpModal();}"
             + "function rescanTv(){if(window.AndroidBridge)AndroidBridge.rescan();closeIpModal();}"
-            /* Multi-Touch Laptop Precision Trackpad Engine (High-Sensitivity 2-Finger Scroll) */
+            /* Multi-Touch Laptop Precision Trackpad Engine (Conflict-Free Single-Axis + High-Sensi Scroll) */
             + "const pad=document.getElementById('trackpad');"
             + "const glow=document.getElementById('touchGlow');"
-            + "let touches=0,maxTouches=0,lastX=0,lastY=0,moved=false,tStart=0,lastSend=0,longTimer=null;"
+            + "let touches=0,maxTouches=0,startX=0,startY=0,lastX=0,lastY=0,moved=false,tStart=0,lastSend=0,lastMoveEnd=0,longTimer=null;"
             + "pad.addEventListener('touchstart',e=>{"
             + "  e.preventDefault();"
             + "  touches=e.touches.length;"
@@ -528,14 +529,15 @@ public final class MainActivity extends Activity {
             + "  glow.style.left=(t.clientX-r.left)+'px';"
             + "  glow.style.top=(t.clientY-r.top)+'px';"
             + "  glow.style.opacity='1';"
-            + "  if(touches===1){"
-            + "    lastX=t.clientX;lastY=t.clientY;moved=false;tStart=Date.now();"
+            + "  if(touches===1&&maxTouches===1){"
+            + "    startX=lastX=t.clientX;startY=lastY=t.clientY;moved=false;tStart=Date.now();"
             + "    clearTimeout(longTimer);"
-            + "    longTimer=setTimeout(()=>{if(!moved&&maxTouches===1){moved=true;api('longclick',true);}},500);"
+            + "    longTimer=setTimeout(()=>{if(!moved&&maxTouches===1&&(Date.now()-lastMoveEnd>200)){moved=true;api('longclick',true);}},550);"
             + "  }else if(touches>=2){"
             + "    clearTimeout(longTimer);"
-            + "    lastX=(e.touches[0].clientX+e.touches[1].clientX)/2;"
-            + "    lastY=(e.touches[0].clientY+e.touches[1].clientY)/2;"
+            + "    const cx=(e.touches[0].clientX+e.touches[1].clientX)/2;"
+            + "    const cy=(e.touches[0].clientY+e.touches[1].clientY)/2;"
+            + "    startX=lastX=cx;startY=lastY=cy;"
             + "  }"
             + "},{passive:false});"
             + "pad.addEventListener('touchmove',e=>{"
@@ -547,13 +549,15 @@ public final class MainActivity extends Activity {
             + "  glow.style.top=(t.clientY-r.top)+'px';"
             + "  if(e.touches.length===1&&maxTouches===1){"
             + "    const rawDx=t.clientX-lastX,rawDy=t.clientY-lastY;"
+            + "    const totalDist=Math.hypot(t.clientX-startX,t.clientY-startY);"
             + "    const dist=Math.hypot(rawDx,rawDy);"
-            + "    if(dist>2.0){"
+            + "    if(totalDist>5.0)moved=true;"
+            + "    if(dist>2.2){"
             + "      moved=true;clearTimeout(longTimer);"
-            + "      if(now-lastSend>=20){"
-            + "        const accel=Math.min(3.5,1.55+dist*0.05);"
+            + "      if(now-lastSend>=22){"
+            + "        const accel=Math.min(3.2,1.5+dist*0.05);"
             + "        const dx=rawDx*accel,dy=rawDy*accel;"
-            + "        lastX=t.clientX;lastY=t.clientY;lastSend=now;"
+            + "        lastX=t.clientX;lastY=t.clientY;lastSend=now;lastMoveEnd=now;"
             + "        api('move&dx='+dx.toFixed(1)+'&dy='+dy.toFixed(1),false);"
             + "      }"
             + "    }"
@@ -562,13 +566,16 @@ public final class MainActivity extends Activity {
             + "    const cx=(e.touches[0].clientX+e.touches[1].clientX)/2;"
             + "    const cy=(e.touches[0].clientY+e.touches[1].clientY)/2;"
             + "    const rawDx=cx-lastX,rawDy=cy-lastY;"
+            + "    const totalDist=Math.hypot(cx-startX,cy-startY);"
             + "    const dist=Math.hypot(rawDx,rawDy);"
-            + "    if(dist>2.5){"
+            + "    if(totalDist>4.5)moved=true;"
+            + "    if(dist>2.2){"
             + "      moved=true;"
             + "      if(now-lastSend>=28){"
-            + "        const boost=Math.min(9.5,5.2+dist*0.14);"
-            + "        const dx=rawDx*boost,dy=rawDy*boost;"
-            + "        lastX=cx;lastY=cy;lastSend=now;"
+            + "        const boost=Math.min(8.5,4.8+dist*0.12);"
+            + "        let dx=0,dy=0;"
+            + "        if(Math.abs(rawDy)>=Math.abs(rawDx)){dy=rawDy*boost;}else{dx=rawDx*boost;}"
+            + "        lastX=cx;lastY=cy;lastSend=now;lastMoveEnd=now;"
             + "        api('scroll&dx='+dx.toFixed(0)+'&dy='+dy.toFixed(0),false);"
             + "      }"
             + "    }"
@@ -579,8 +586,9 @@ public final class MainActivity extends Activity {
             + "  clearTimeout(longTimer);"
             + "  if(e.touches.length===0){"
             + "    glow.style.opacity='0';"
-            + "    const dur=Date.now()-tStart;"
-            + "    if(!moved&&dur<300){"
+            + "    const now=Date.now();"
+            + "    const dur=now-tStart;"
+            + "    if(!moved&&dur<250&&(now-lastMoveEnd>150)){"
             + "      if(maxTouches===1)api('click',true);"
             + "      else if(maxTouches===2)api('key&val=BACK',true);"
             + "      else if(maxTouches>=3)api('key&val=HOME',true);"
