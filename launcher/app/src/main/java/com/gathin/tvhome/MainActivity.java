@@ -361,6 +361,47 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     };
     // Right after boot the clock is often wrong until network time arrives; don't wait a minute to catch up.
     private final IntentFilter timeFilter = new IntentFilter(Intent.ACTION_TIME_CHANGED);
+    private final IntentFilter remoteFilter = new IntentFilter("com.gathin.tvhome.REMOTE_KEY");
+    private final BroadcastReceiver remoteReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (!hasWindowFocus() || isFinishing() || adapter == null) return;
+            String key = intent.getStringExtra("key");
+            if (key == null) return;
+            restartIdleClock();
+            int count = adapter.appCount();
+            if (count <= 0) return;
+            int cur = Math.max(0, Math.min(lastFocused, count - 1));
+            switch (key) {
+                case "LEFT":
+                    if (cur > 0) focusTile(cur - 1);
+                    break;
+                case "RIGHT":
+                    if (cur + 1 < count) focusTile(cur + 1);
+                    break;
+                case "UP":
+                    if (cur >= COLUMNS) focusTile(cur - COLUMNS);
+                    else firstTopButton().requestFocus();
+                    break;
+                case "DOWN":
+                    if (cur + COLUMNS < count) focusTile(cur + COLUMNS);
+                    else if (cur < count - 1) focusTile(count - 1);
+                    break;
+                case "OK":
+                    RecyclerView.ViewHolder vh = grid.findViewHolderForAdapterPosition(cur);
+                    if (vh != null) {
+                        View card = vh.itemView.findViewById(R.id.card);
+                        if (card != null) {
+                            card.performClick();
+                            return;
+                        }
+                    }
+                    View focused = getCurrentFocus();
+                    if (focused != null && focused != grid) focused.performClick();
+                    break;
+            }
+        }
+    };
     private final BroadcastReceiver timeReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
@@ -930,8 +971,10 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         started = true;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(timeReceiver, timeFilter, Context.RECEIVER_NOT_EXPORTED);
+            registerReceiver(remoteReceiver, remoteFilter, Context.RECEIVER_EXPORTED);
         } else {
             registerReceiver(timeReceiver, timeFilter);
+            registerReceiver(remoteReceiver, remoteFilter);
         }
         updateClockVisibility();
         tileRefresh.onStart();
@@ -1173,6 +1216,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         super.onStop();
         started = false;
         unregisterReceiver(timeReceiver);
+        try { unregisterReceiver(remoteReceiver); } catch (Exception ignored) {}
         handler.removeCallbacks(clockCheck);
         stopped = true;
         tileRefresh.onStop();
@@ -2430,8 +2474,17 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         if (vh != null) {
             View card = vh.itemView.findViewById(R.id.card);
             // Already focused (e.g. back from an app): no focus change fires, so restore the glass by hand.
-            if (card.isFocused()) onTileFocused(pos, card);
-            else card.requestFocus();
+            if (card.isFocused()) {
+                onTileFocused(pos, card);
+            } else {
+                boolean focused = card.requestFocus();
+                if (!focused) {
+                    card.setFocusableInTouchMode(true);
+                    card.requestFocus();
+                    card.setFocusableInTouchMode(false);
+                }
+                onTileFocused(pos, card);
+            }
             return;
         }
         // Not laid out yet: scroll there, then focus once the scroll settles.

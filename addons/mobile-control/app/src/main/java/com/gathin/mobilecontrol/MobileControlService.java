@@ -2,22 +2,28 @@ package com.gathin.mobilecontrol;
 
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
+import android.animation.ValueAnimator;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.LinearGradient;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
+import android.graphics.Rect;
+import android.graphics.Shader;
 import android.media.AudioManager;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
@@ -33,9 +39,13 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class MobileControlService extends AccessibilityService {
 
@@ -51,6 +61,12 @@ public class MobileControlService extends AccessibilityService {
     private float cursorX = 640f;
     private float cursorY = 360f;
     private boolean cursorAdded = false;
+    private volatile boolean remoteMode = false;
+
+    private final AtomicInteger kbSeq = new AtomicInteger(0);
+    private volatile boolean editableNow = false;
+    private long lastKbTriggerMs = 0L;
+    private final Rect lastRemoteFocusRect = new Rect();
 
     private ServerSocket serverSocket;
     private volatile boolean running = false;
@@ -59,7 +75,9 @@ public class MobileControlService extends AccessibilityService {
         @Override
         public void run() {
             if (cursorView != null) {
-                cursorView.setVisibility(View.GONE);
+                cursorView.animate().alpha(0f).setDuration(220).withEndAction(() -> {
+                    if (cursorView != null) cursorView.setVisibility(View.GONE);
+                }).start();
             }
         }
     };
@@ -82,10 +100,120 @@ public class MobileControlService extends AccessibilityService {
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
+        if (event == null) return;
+        int type = event.getEventType();
+        if (type == AccessibilityEvent.TYPE_VIEW_FOCUSED
+                || type == AccessibilityEvent.TYPE_VIEW_CLICKED
+                || type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            AccessibilityNodeInfo src = event.getSource();
+            if (src != null) {
+                boolean isEdit = isNodeEditableOrSearch(src, type == AccessibilityEvent.TYPE_VIEW_CLICKED);
+                src.recycle();
+                if (isEdit) {
+                    triggerKeyboardPopup();
+                    return;
+                }
+            }
+            checkActiveWindowForEditable(false);
+        }
     }
 
     @Override
     public void onInterrupt() {
+    }
+
+    private void triggerKeyboardPopup() {
+        long now = System.currentTimeMillis();
+        editableNow = true;
+        if (now - lastKbTriggerMs > 650) {
+            lastKbTriggerMs = now;
+            kbSeq.incrementAndGet();
+        }
+    }
+
+    private boolean isNodeEditableOrSearch(AccessibilityNodeInfo node, boolean includeSearchButtons) {
+        if (node == null) return false;
+        if (node.isEditable()) return true;
+        CharSequence cls = node.getClassName();
+        if (cls != null) {
+            String c = cls.toString().toLowerCase(Locale.US);
+            if (c.contains("edittext") || c.contains("autocompletetextview") || c.contains("searchview")) {
+                return true;
+            }
+        }
+        if (includeSearchButtons) {
+            String combined = ((node.getText() != null ? node.getText().toString() : "") + " "
+                    + (node.getContentDescription() != null ? node.getContentDescription().toString() : "") + " "
+                    + (node.getViewIdResourceName() != null ? node.getViewIdResourceName() : "")).toLowerCase(Locale.US);
+            if (combined.contains("search") || combined.contains("url_bar") || combined.contains("omnibox")
+                    || combined.contains("query") || combined.contains("type ") || combined.contains("keyboard")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void checkActiveWindowForEditable(boolean clickedSearchCheck) {
+        try {
+            AccessibilityNodeInfo focus = findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+            if (focus != null) {
+                boolean edit = isNodeEditableOrSearch(focus, clickedSearchCheck);
+                focus.recycle();
+                if (edit) {
+                    triggerKeyboardPopup();
+                    return;
+                }
+            }
+            AccessibilityNodeInfo root = getRootInActiveWindow();
+            if (root != null) {
+                AccessibilityNodeInfo editNode = findFirstEditableNode(root);
+                root.recycle();
+                if (editNode != null) {
+                    boolean focused = editNode.isFocused() || editNode.isAccessibilityFocused() || clickedSearchCheck;
+                    editNode.recycle();
+                    if (focused) {
+                        triggerKeyboardPopup();
+                        return;
+                    }
+                }
+            }
+            editableNow = false;
+        } catch (Exception ignored) {
+        }
+    }
+
+    private AccessibilityNodeInfo findFirstEditableNode(AccessibilityNodeInfo node) {
+        if (node == null) return null;
+        if (node.isVisibleToUser() && node.isEditable()) {
+            return AccessibilityNodeInfo.obtain(node);
+        }
+        int count = node.getChildCount();
+        for (int i = 0; i < count; i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child != null) {
+                AccessibilityNodeInfo found = findFirstEditableNode(child);
+                child.recycle();
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
+    private AccessibilityNodeInfo findDeepestNodeAt(AccessibilityNodeInfo node, int x, int y) {
+        if (node == null || !node.isVisibleToUser()) return null;
+        Rect r = new Rect();
+        node.getBoundsInScreen(r);
+        if (!r.contains(x, y)) return null;
+        int count = node.getChildCount();
+        for (int i = count - 1; i >= 0; i--) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child != null) {
+                AccessibilityNodeInfo hit = findDeepestNodeAt(child, x, y);
+                child.recycle();
+                if (hit != null) return hit;
+            }
+        }
+        return AccessibilityNodeInfo.obtain(node);
     }
 
     private void setupOverlay() {
@@ -100,7 +228,7 @@ public class MobileControlService extends AccessibilityService {
 
                 cursorView = new CursorView(this);
                 cursorParams = new WindowManager.LayoutParams(
-                        36, 36,
+                        56, 56,
                         WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                         WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                                 | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
@@ -130,76 +258,152 @@ public class MobileControlService extends AccessibilityService {
         });
     }
 
+    private void hideCursorNow() {
+        mainHandler.post(() -> {
+            mainHandler.removeCallbacks(hideCursorRunnable);
+            if (cursorView != null) {
+                cursorView.animate().cancel();
+                cursorView.setAlpha(0f);
+                cursorView.setVisibility(View.GONE);
+            }
+        });
+    }
+
+    private void showCursorAndScheduleHide() {
+        if (remoteMode || cursorView == null) return;
+        cursorView.animate().cancel();
+        cursorView.setAlpha(1f);
+        if (cursorView.getVisibility() != View.VISIBLE) {
+            cursorView.setVisibility(View.VISIBLE);
+        }
+        mainHandler.removeCallbacks(hideCursorRunnable);
+        mainHandler.postDelayed(hideCursorRunnable, 3800);
+    }
+
     private void moveCursor(float dx, float dy) {
+        remoteMode = false;
         mainHandler.post(() -> {
             if (!cursorAdded || cursorView == null) {
                 setupOverlay();
                 return;
             }
-            cursorX = Math.max(0f, Math.min(screenW - 8f, cursorX + dx));
-            cursorY = Math.max(0f, Math.min(screenH - 8f, cursorY + dy));
+            cursorX = Math.max(0f, Math.min(screenW - 6f, cursorX + dx));
+            cursorY = Math.max(0f, Math.min(screenH - 6f, cursorY + dy));
             cursorParams.x = (int) cursorX;
             cursorParams.y = (int) cursorY;
-            cursorView.setVisibility(View.VISIBLE);
+            showCursorAndScheduleHide();
             try {
                 windowManager.updateViewLayout(cursorView, cursorParams);
             } catch (Exception ignored) {
             }
-            mainHandler.removeCallbacks(hideCursorRunnable);
-            mainHandler.postDelayed(hideCursorRunnable, 5000);
         });
     }
 
-    private void clickAtCursor() {
+    private void clickAtCursor(boolean longPress) {
+        remoteMode = false;
         mainHandler.post(() -> {
             if (cursorView != null) {
-                cursorView.setVisibility(View.VISIBLE);
-                mainHandler.removeCallbacks(hideCursorRunnable);
-                mainHandler.postDelayed(hideCursorRunnable, 5000);
+                showCursorAndScheduleHide();
+                cursorView.playClickPulse();
             }
+            final int tapX = (int) cursorX;
+            final int tapY = (int) cursorY;
+
+            // Pre-check if the user clicked directly on a Search button or EditText
+            try {
+                AccessibilityNodeInfo root = getRootInActiveWindow();
+                if (root != null) {
+                    AccessibilityNodeInfo hit = findDeepestNodeAt(root, tapX, tapY);
+                    root.recycle();
+                    if (hit != null) {
+                        boolean isSearchOrEdit = isNodeEditableOrSearch(hit, true);
+                        AccessibilityNodeInfo parent = hit.getParent();
+                        if (!isSearchOrEdit && parent != null) {
+                            isSearchOrEdit = isNodeEditableOrSearch(parent, true);
+                        }
+                        if (parent != null) parent.recycle();
+                        hit.recycle();
+                        if (isSearchOrEdit) {
+                            triggerKeyboardPopup();
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+
             try {
                 Path path = new Path();
                 path.moveTo(cursorX, cursorY);
                 GestureDescription.Builder builder = new GestureDescription.Builder();
-                builder.addStroke(new GestureDescription.StrokeDescription(path, 0, 45));
+                builder.addStroke(new GestureDescription.StrokeDescription(path, 0, longPress ? 520 : 42));
                 dispatchGesture(builder.build(), null, null);
             } catch (Exception ignored) {
             }
+
+            mainHandler.postDelayed(() -> checkActiveWindowForEditable(true), 220);
+            mainHandler.postDelayed(() -> checkActiveWindowForEditable(false), 520);
         });
     }
 
-    private void scrollAtCursor(float dy) {
+    private void scrollAtCursor(float dx, float dy) {
         mainHandler.post(() -> {
             try {
-                float startY = Math.max(80f, Math.min(screenH - 80f, cursorY));
-                float endY = Math.max(40f, Math.min(screenH - 40f, startY + dy));
+                float cx = remoteMode ? (screenW / 2f) : cursorX;
+                float cy = remoteMode ? (screenH / 2f) : cursorY;
+                float startX = Math.max(80f, Math.min(screenW - 80f, cx));
+                float startY = Math.max(80f, Math.min(screenH - 80f, cy));
+                float endX = Math.max(30f, Math.min(screenW - 30f, startX + dx));
+                float endY = Math.max(30f, Math.min(screenH - 30f, startY + dy));
+                if (Math.abs(endX - startX) < 4f && Math.abs(endY - startY) < 4f) return;
                 Path path = new Path();
-                path.moveTo(cursorX, startY);
-                path.lineTo(cursorX, endY);
+                path.moveTo(startX, startY);
+                path.lineTo(endX, endY);
                 GestureDescription.Builder builder = new GestureDescription.Builder();
-                builder.addStroke(new GestureDescription.StrokeDescription(path, 0, 180));
+                builder.addStroke(new GestureDescription.StrokeDescription(path, 0, 150));
                 dispatchGesture(builder.build(), null, null);
             } catch (Exception ignored) {
             }
         });
     }
 
-    private void injectText(String text) {
-        if (text == null || text.isEmpty()) return;
+    private void injectText(String text, boolean submit) {
+        if (text == null) return;
         mainHandler.post(() -> {
             try {
-                ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-                if (cm != null) {
-                    cm.setPrimaryClip(ClipData.newPlainText("tv", text));
+                if (!text.isEmpty()) {
+                    ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                    if (cm != null) {
+                        cm.setPrimaryClip(ClipData.newPlainText("tv", text));
+                    }
                 }
-                AccessibilityNodeInfo focus = findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
-                if (focus != null) {
+                AccessibilityNodeInfo target = findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+                if (target != null && !target.isEditable()) {
+                    target.recycle();
+                    target = null;
+                }
+                if (target == null) {
+                    AccessibilityNodeInfo root = getRootInActiveWindow();
+                    if (root != null) {
+                        target = findFirstEditableNode(root);
+                        root.recycle();
+                    }
+                }
+                if (target != null) {
+                    target.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
                     Bundle b = new Bundle();
                     b.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text);
-                    if (!focus.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, b)) {
-                        focus.performAction(AccessibilityNodeInfo.ACTION_PASTE);
+                    if (!target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, b) && !text.isEmpty()) {
+                        target.performAction(AccessibilityNodeInfo.ACTION_PASTE);
                     }
-                    focus.recycle();
+                    if (submit) {
+                        if (Build.VERSION.SDK_INT >= 30) {
+                            target.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.getId());
+                        }
+                        target.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                    }
+                    target.recycle();
+                } else if (submit && !text.trim().isEmpty()) {
+                    openUrlInBrave(text.trim());
                 }
             } catch (Exception ignored) {
             }
@@ -253,6 +457,8 @@ public class MobileControlService extends AccessibilityService {
 
     private void handleKeyAction(String key) {
         if (key == null) return;
+        remoteMode = true;
+        hideCursorNow();
         mainHandler.post(() -> {
             try {
                 AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
@@ -275,26 +481,26 @@ public class MobileControlService extends AccessibilityService {
                     case "MUTE":
                         if (am != null) am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_TOGGLE_MUTE, AudioManager.FLAG_SHOW_UI);
                         break;
-                    case "OK":
-                        AccessibilityNodeInfo f = findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
-                        if (f != null && f.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                            f.recycle();
-                        } else {
-                            if (f != null) f.recycle();
-                            clickAtCursor();
+                    case "PLAY_PAUSE":
+                        if (am != null) {
+                            am.dispatchMediaKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE));
+                            am.dispatchMediaKeyEvent(new KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE));
                         }
                         break;
+                    case "OK":
+                        performRemoteOk();
+                        break;
                     case "UP":
-                        moveFocusOrSwipe(View.FOCUS_UP, 0, 220);
+                        performRemoteDirection(View.FOCUS_UP, "UP", 0, 220);
                         break;
                     case "DOWN":
-                        moveFocusOrSwipe(View.FOCUS_DOWN, 0, -220);
+                        performRemoteDirection(View.FOCUS_DOWN, "DOWN", 0, -220);
                         break;
                     case "LEFT":
-                        moveFocusOrSwipe(View.FOCUS_LEFT, 220, 0);
+                        performRemoteDirection(View.FOCUS_LEFT, "LEFT", 220, 0);
                         break;
                     case "RIGHT":
-                        moveFocusOrSwipe(View.FOCUS_RIGHT, -220, 0);
+                        performRemoteDirection(View.FOCUS_RIGHT, "RIGHT", -220, 0);
                         break;
                 }
             } catch (Exception ignored) {
@@ -302,22 +508,184 @@ public class MobileControlService extends AccessibilityService {
         });
     }
 
-    private void moveFocusOrSwipe(int direction, float dx, float dy) {
+    private void performRemoteDirection(int focusDir, String keyName, float swipeDx, float swipeDy) {
+        // 1. Send direct broadcast to our Launcher (works even in Touch Mode!)
+        try {
+            Intent b = new Intent("com.gathin.tvhome.REMOTE_KEY");
+            b.setPackage("com.gathin.tvhome");
+            b.putExtra("key", keyName);
+            sendBroadcast(b);
+        } catch (Exception ignored) {
+        }
+
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root != null) {
+            CharSequence pkg = root.getPackageName();
+            if (pkg != null && "com.gathin.tvhome".equals(pkg.toString())) {
+                root.recycle();
+                return;
+            }
+        }
+
+        // 2. For all other apps: try focusSearch or spatial 2D focus navigation
         try {
             AccessibilityNodeInfo current = findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+            if (current == null) {
+                current = findFocus(AccessibilityNodeInfo.FOCUS_ACCESSIBILITY);
+            }
             if (current != null) {
-                AccessibilityNodeInfo next = current.focusSearch(direction);
+                current.getBoundsInScreen(lastRemoteFocusRect);
+                AccessibilityNodeInfo next = current.focusSearch(focusDir);
                 current.recycle();
                 if (next != null) {
-                    boolean ok = next.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-                            || next.performAction(AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS);
+                    next.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+                    next.performAction(AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS);
+                    next.getBoundsInScreen(lastRemoteFocusRect);
                     next.recycle();
-                    if (ok) return;
+                    if (root != null) root.recycle();
+                    return;
                 }
+            }
+            if (root != null) {
+                List<AccessibilityNodeInfo> candidates = new ArrayList<>();
+                collectInteractiveNodes(root, candidates);
+                if (!candidates.isEmpty()) {
+                    if (lastRemoteFocusRect.isEmpty()) {
+                        AccessibilityNodeInfo first = candidates.get(0);
+                        first.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+                        first.performAction(AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS);
+                        first.getBoundsInScreen(lastRemoteFocusRect);
+                    } else {
+                        AccessibilityNodeInfo best = pickSpatialNeighbor(candidates, lastRemoteFocusRect, focusDir);
+                        if (best != null) {
+                            best.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+                            best.performAction(AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS);
+                            best.getBoundsInScreen(lastRemoteFocusRect);
+                            for (AccessibilityNodeInfo n : candidates) n.recycle();
+                            root.recycle();
+                            return;
+                        }
+                    }
+                    for (AccessibilityNodeInfo n : candidates) n.recycle();
+                }
+                root.recycle();
             }
         } catch (Exception ignored) {
         }
-        if (dy != 0) scrollAtCursor(dy);
+        if (swipeDy != 0 || swipeDx != 0) {
+            scrollAtCursor(swipeDx, swipeDy);
+        }
+    }
+
+    private void performRemoteOk() {
+        // 1. Send direct broadcast to our Launcher
+        try {
+            Intent b = new Intent("com.gathin.tvhome.REMOTE_KEY");
+            b.setPackage("com.gathin.tvhome");
+            b.putExtra("key", "OK");
+            sendBroadcast(b);
+        } catch (Exception ignored) {
+        }
+
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root != null) {
+            CharSequence pkg = root.getPackageName();
+            if (pkg != null && "com.gathin.tvhome".equals(pkg.toString())) {
+                root.recycle();
+                return;
+            }
+        }
+
+        // 2. For all other apps: click focused node (NEVER click the mouse cursor!)
+        try {
+            AccessibilityNodeInfo f = findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+            if (f == null) f = findFocus(AccessibilityNodeInfo.FOCUS_ACCESSIBILITY);
+            if (f != null) {
+                boolean isSearch = isNodeEditableOrSearch(f, true);
+                Rect r = new Rect();
+                f.getBoundsInScreen(r);
+                boolean clicked = f.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                f.recycle();
+                if (isSearch) triggerKeyboardPopup();
+                if (!clicked && !r.isEmpty()) {
+                    silentTapAt(r.centerX(), r.centerY());
+                }
+                if (root != null) root.recycle();
+                mainHandler.postDelayed(() -> checkActiveWindowForEditable(true), 220);
+                return;
+            }
+            if (!lastRemoteFocusRect.isEmpty()) {
+                silentTapAt(lastRemoteFocusRect.centerX(), lastRemoteFocusRect.centerY());
+                mainHandler.postDelayed(() -> checkActiveWindowForEditable(true), 220);
+            }
+            if (root != null) root.recycle();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void silentTapAt(int x, int y) {
+        try {
+            Path path = new Path();
+            path.moveTo(x, y);
+            GestureDescription.Builder builder = new GestureDescription.Builder();
+            builder.addStroke(new GestureDescription.StrokeDescription(path, 0, 40));
+            dispatchGesture(builder.build(), null, null);
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void collectInteractiveNodes(AccessibilityNodeInfo node, List<AccessibilityNodeInfo> out) {
+        if (node == null || !node.isVisibleToUser()) return;
+        if (node.isClickable() || node.isFocusable()) {
+            Rect r = new Rect();
+            node.getBoundsInScreen(r);
+            if (r.width() > 16 && r.height() > 16) {
+                out.add(AccessibilityNodeInfo.obtain(node));
+            }
+        }
+        int count = node.getChildCount();
+        for (int i = 0; i < count; i++) {
+            AccessibilityNodeInfo c = node.getChild(i);
+            if (c != null) {
+                collectInteractiveNodes(c, out);
+                c.recycle();
+            }
+        }
+    }
+
+    private AccessibilityNodeInfo pickSpatialNeighbor(List<AccessibilityNodeInfo> nodes, Rect from, int dir) {
+        int fx = from.centerX();
+        int fy = from.centerY();
+        AccessibilityNodeInfo best = null;
+        double bestScore = Double.MAX_VALUE;
+        Rect r = new Rect();
+        for (AccessibilityNodeInfo n : nodes) {
+            n.getBoundsInScreen(r);
+            int cx = r.centerX();
+            int cy = r.centerY();
+            if (cx == fx && cy == fy) continue;
+            int dx = cx - fx;
+            int dy = cy - fy;
+            boolean valid = false;
+            double primary = 0, orthogonal = 0;
+            if (dir == View.FOCUS_LEFT && dx < -15) {
+                valid = true; primary = -dx; orthogonal = Math.abs(dy) * 2.4;
+            } else if (dir == View.FOCUS_RIGHT && dx > 15) {
+                valid = true; primary = dx; orthogonal = Math.abs(dy) * 2.4;
+            } else if (dir == View.FOCUS_UP && dy < -15) {
+                valid = true; primary = -dy; orthogonal = Math.abs(dx) * 2.0;
+            } else if (dir == View.FOCUS_DOWN && dy > 15) {
+                valid = true; primary = dy; orthogonal = Math.abs(dx) * 2.0;
+            }
+            if (valid) {
+                double score = primary + orthogonal;
+                if (score < bestScore) {
+                    bestScore = score;
+                    best = n;
+                }
+            }
+        }
+        return best;
     }
 
     private void startHttpServer() {
@@ -366,20 +734,44 @@ public class MobileControlService extends AccessibilityService {
                     float dy = parseFloat(q.get("dy"));
                     moveCursor(dx, dy);
                 } else if ("click".equals(cmd)) {
-                    clickAtCursor();
+                    clickAtCursor(false);
+                } else if ("longclick".equals(cmd)) {
+                    clickAtCursor(true);
                 } else if ("scroll".equals(cmd)) {
+                    float dx = parseFloat(q.get("dx"));
                     float dy = parseFloat(q.get("dy"));
-                    scrollAtCursor(dy);
+                    scrollAtCursor(dx, dy);
+                } else if ("mode".equals(cmd)) {
+                    String m = q.get("val");
+                    if ("remote".equals(m)) {
+                        remoteMode = true;
+                        hideCursorNow();
+                    } else {
+                        remoteMode = false;
+                    }
+                } else if ("cursor".equals(cmd)) {
+                    if ("hide".equals(q.get("val"))) {
+                        hideCursorNow();
+                    }
                 } else if ("key".equals(cmd)) {
                     handleKeyAction(q.get("val"));
                 } else if ("text".equals(cmd)) {
-                    injectText(q.get("val"));
+                    injectText(q.get("val"), false);
+                } else if ("submit".equals(cmd)) {
+                    injectText(q.get("val"), true);
                 } else if ("url".equals(cmd)) {
                     openUrlInBrave(q.get("val"));
                 } else if ("app".equals(cmd)) {
                     launchPackage(q.get("pkg"));
                 }
-                byte[] body = "{\"ok\":true}".getBytes(StandardCharsets.UTF_8);
+                String json = "{\"ok\":true,\"kbSeq\":" + kbSeq.get() + ",\"editable\":" + editableNow + "}";
+                byte[] body = json.getBytes(StandardCharsets.UTF_8);
+                String header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + body.length + "\r\nConnection: close\r\n\r\n";
+                out.write(header.getBytes(StandardCharsets.UTF_8));
+                out.write(body);
+            } else if (path.startsWith("/state")) {
+                String json = "{\"ok\":true,\"kbSeq\":" + kbSeq.get() + ",\"editable\":" + editableNow + "}";
+                byte[] body = json.getBytes(StandardCharsets.UTF_8);
                 String header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + body.length + "\r\nConnection: close\r\n\r\n";
                 out.write(header.getBytes(StandardCharsets.UTF_8));
                 out.write(body);
@@ -436,129 +828,88 @@ public class MobileControlService extends AccessibilityService {
         return "192.168.0.233";
     }
 
+    /**
+     * Premium macOS Sonoma / Apple VisionOS inspired fluid pointer with diffused drop shadow,
+     * obsidian glass core, pearl-white rim, cyan tip glow, and radial click pulse animation.
+     */
     private static final class CursorView extends View {
-        private final Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint strokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Path arrowPath = new Path();
+        private final Paint shadowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint bodyPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint rimPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint tipGlowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint pulsePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Path pointerPath = new Path();
+        private final Path shadowPath = new Path();
+        private float pulseProgress = 0f;
 
         CursorView(Context context) {
             super(context);
-            fillPaint.setColor(Color.parseColor("#10B981"));
-            fillPaint.setStyle(Paint.Style.FILL);
-            strokePaint.setColor(Color.WHITE);
-            strokePaint.setStyle(Paint.Style.STROKE);
-            strokePaint.setStrokeWidth(2.5f);
+            shadowPaint.setColor(Color.argb(135, 0, 0, 0));
+            shadowPaint.setStyle(Paint.Style.FILL);
 
-            arrowPath.moveTo(2f, 2f);
-            arrowPath.lineTo(2f, 28f);
-            arrowPath.lineTo(10f, 21f);
-            arrowPath.lineTo(16f, 32f);
-            arrowPath.lineTo(21f, 29f);
-            arrowPath.lineTo(15f, 18f);
-            arrowPath.lineTo(25f, 18f);
-            arrowPath.close();
+            bodyPaint.setShader(new LinearGradient(4f, 4f, 26f, 34f,
+                    Color.parseColor("#1E293B"), Color.parseColor("#090D16"), Shader.TileMode.CLAMP));
+            bodyPaint.setStyle(Paint.Style.FILL);
+
+            rimPaint.setColor(Color.WHITE);
+            rimPaint.setStyle(Paint.Style.STROKE);
+            rimPaint.setStrokeWidth(2.4f);
+            rimPaint.setStrokeJoin(Paint.Join.ROUND);
+            rimPaint.setStrokeCap(Paint.Cap.ROUND);
+
+            tipGlowPaint.setColor(Color.parseColor("#38BDF8"));
+            tipGlowPaint.setStyle(Paint.Style.FILL);
+
+            pulsePaint.setColor(Color.parseColor("#38BDF8"));
+            pulsePaint.setStyle(Paint.Style.STROKE);
+            pulsePaint.setStrokeWidth(2.2f);
+
+            // Sleek macOS / VisionOS rounded arrow geometry
+            pointerPath.moveTo(5f, 4f);
+            pointerPath.lineTo(5f, 31f);
+            pointerPath.lineTo(12.2f, 24.2f);
+            pointerPath.lineTo(17.8f, 35.5f);
+            pointerPath.lineTo(22.5f, 33.2f);
+            pointerPath.lineTo(16.8f, 21.8f);
+            pointerPath.lineTo(26.5f, 21.8f);
+            pointerPath.close();
+
+            shadowPath.set(pointerPath);
+            shadowPath.offset(2.2f, 3.2f);
+        }
+
+        void playClickPulse() {
+            ValueAnimator va = ValueAnimator.ofFloat(0.01f, 1f);
+            va.setDuration(240);
+            va.addUpdateListener(anim -> {
+                pulseProgress = (float) anim.getAnimatedValue();
+                invalidate();
+            });
+            va.start();
         }
 
         @Override
         protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
-            canvas.drawPath(arrowPath, fillPaint);
-            canvas.drawPath(arrowPath, strokePaint);
+            if (pulseProgress > 0.01f && pulseProgress < 0.99f) {
+                int alpha = (int) ((1f - pulseProgress) * 210);
+                pulsePaint.setAlpha(alpha);
+                float radius = 6f + pulseProgress * 18f;
+                canvas.drawCircle(6f, 6f, radius, pulsePaint);
+            }
+            canvas.drawPath(shadowPath, shadowPaint);
+            canvas.drawPath(pointerPath, bodyPaint);
+            canvas.drawPath(pointerPath, rimPaint);
+            canvas.drawCircle(6.2f, 6.2f, 2.0f, tipGlowPaint);
         }
     }
 
     private static final String WEB_UI_HTML =
         "<!DOCTYPE html><html><head><meta charset='utf-8'>" +
         "<meta name='viewport' content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>" +
-        "<title>Xiaomi TV Mobile Control</title>" +
+        "<title>MiTV Studio Remote</title>" +
         "<style>" +
         "*{box-sizing:border-box;-webkit-user-select:none;user-select:none;touch-action:manipulation;}" +
-        "body{margin:0;background:#070A14;color:#F8FAFC;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;flex-direction:column;height:100vh;overflow:hidden;}" +
-        "header{padding:12px 16px;background:#0F172A;border-bottom:1px solid #1E293B;display:flex;justify-content:space-between;align-items:center;}" +
-        "header h1{margin:0;font-size:16px;font-weight:700;color:#10B981;}" +
-        ".tabs{display:flex;background:#0F172A;padding:6px;gap:6px;border-bottom:1px solid #1E293B;}" +
-        ".tab{flex:1;padding:10px 4px;text-align:center;border-radius:10px;font-size:13px;font-weight:600;color:#94A3B8;background:#1E293B;cursor:pointer;}" +
-        ".tab.active{background:#10B981;color:#052E16;}" +
-        ".panel{display:none;flex:1;flex-direction:column;padding:12px;gap:10px;overflow-y:auto;}" +
-        ".panel.active{display:flex;}" +
-        ".pad-wrap{flex:1;display:flex;gap:10px;min-height:240px;}" +
-        "#touchpad{flex:1;background:radial-gradient(circle at center,#1E293B,#0F172A);border:2px solid #334155;border-radius:18px;display:flex;align-items:center;justify-content:center;color:#64748B;font-size:14px;text-align:center;touch-action:none;}" +
-        "#scrollbar{width:54px;background:#1E293B;border:2px solid #334155;border-radius:18px;display:flex;align-items:center;justify-content:center;color:#94A3B8;font-size:12px;writing-mode:vertical-rl;touch-action:none;}" +
-        ".row{display:flex;gap:8px;}" +
-        ".btn{flex:1;padding:14px 10px;background:#1E293B;border:1px solid #334155;border-radius:14px;color:#F8FAFC;font-size:14px;font-weight:600;text-align:center;active:scale(0.97);}" +
-        ".btn:active{background:#10B981;color:#052E16;}" +
-        ".btn.accent{background:#10B981;color:#052E16;border-color:#10B981;}" +
-        "input[type=text]{flex:1;padding:14px;border-radius:12px;border:1px solid #334155;background:#0F172A;color:#FFF;font-size:15px;-webkit-user-select:text;user-select:text;}" +
-        ".dpad{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;max-width:280px;margin:auto;width:100%;}" +
-        ".dpad .btn{padding:20px 0;font-size:18px;}" +
-        "</style></head><body>" +
-        "<header><h1>📺 MiTV Mobile Control</h1><span style='font-size:12px;color:#94A3B8'>Mouse · Keys · Apps</span></header>" +
-        "<div class='tabs'>" +
-        "<div class='tab active' onclick='showTab(0)'>🖱️ Mouse</div>" +
-        "<div class='tab' onclick='showTab(1)'>⌨️ Brave & Keys</div>" +
-        "<div class='tab' onclick='showTab(2)'>📺 Remote</div>" +
-        "<div class='tab' onclick='showTab(3)'>🎮 Controller</div>" +
-        "</div>" +
-        "<div class='panel active' id='p0'>" +
-        "<div class='pad-wrap'>" +
-        "<div id='touchpad'>Slide to move TV cursor<br>Tap anywhere to Click</div>" +
-        "<div id='scrollbar'>⇅ SCROLL</div>" +
-        "</div>" +
-        "<div class='row'>" +
-        "<div class='btn' onclick=\"api('key&val=BACK')\">⬅ Back</div>" +
-        "<div class='btn accent' onclick=\"api('click')\">🖱️ Left Click</div>" +
-        "<div class='btn' onclick=\"api('key&val=HOME')\">🏠 Home</div>" +
-        "</div></div>" +
-        "<div class='panel' id='p1'>" +
-        "<div class='row'><input id='urlIn' type='text' placeholder='Enter URL or Brave search...'><div class='btn accent' style='flex:0 0 110px' onclick='sendUrl()'>Brave Go</div></div>" +
-        "<div class='row'><input id='txtIn' type='text' placeholder='Type text into focused TV box...'><div class='btn' style='flex:0 0 110px' onclick='sendTxt()'>Send Text</div></div>" +
-        "<div style='font-size:13px;color:#94A3B8;margin-top:6px'>Quick Launch TV & Android Apps:</div>" +
-        "<div class='row'><div class='btn' onclick=\"api('app&pkg=com.brave.browser')\">🦁 Brave Browser</div><div class='btn' onclick=\"api('app&pkg=org.smarttube.stable')\">▶️ SmartTube</div></div>" +
-        "<div class='row'><div class='btn' onclick=\"api('app&pkg=com.google.android.youtube.tv')\">📺 YouTube</div><div class='btn' onclick=\"api('app&pkg=com.limelight')\">💻 Moonlight PC</div></div>" +
-        "<div class='row'><div class='btn' onclick=\"api('app&pkg=com.netflix.ninja')\">🎬 Netflix</div><div class='btn' onclick=\"api('app&pkg=in.startv.hotstar')\">⭐ JioHotstar</div></div>" +
-        "</div>" +
-        "<div class='panel' id='p2'>" +
-        "<div class='dpad'>" +
-        "<div></div><div class='btn' onclick=\"api('key&val=UP')\">▲</div><div></div>" +
-        "<div class='btn' onclick=\"api('key&val=LEFT')\">◄</div><div class='btn accent' onclick=\"api('key&val=OK')\">OK</div><div class='btn' onclick=\"api('key&val=RIGHT')\">►</div>" +
-        "<div></div><div class='btn' onclick=\"api('key&val=DOWN')\">▼</div><div></div>" +
-        "</div>" +
-        "<div class='row'>" +
-        "<div class='btn' onclick=\"api('key&val=BACK')\">⬅ Back</div>" +
-        "<div class='btn' onclick=\"api('key&val=HOME')\">🏠 Home</div>" +
-        "<div class='btn' onclick=\"api('key&val=RECENTS')\">🗂 Apps</div>" +
-        "</div>" +
-        "<div class='row'>" +
-        "<div class='btn' onclick=\"api('key&val=VOL_DOWN')\">🔉 Vol -</div>" +
-        "<div class='btn' onclick=\"api('key&val=MUTE')\">🔇 Mute</div>" +
-        "<div class='btn' onclick=\"api('key&val=VOL_UP')\">🔊 Vol +</div>" +
-        "</div></div>" +
-        "<div class='panel' id='p3'>" +
-        "<div style='display:flex;flex:1;align-items:center;justify-content:space-between;gap:12px'>" +
-        "<div class='dpad' style='max-width:170px'>" +
-        "<div></div><div class='btn' onclick=\"api('key&val=UP')\">▲</div><div></div>" +
-        "<div class='btn' onclick=\"api('key&val=LEFT')\">◄</div><div></div><div class='btn' onclick=\"api('key&val=RIGHT')\">►</div>" +
-        "<div></div><div class='btn' onclick=\"api('key&val=DOWN')\">▼</div><div></div>" +
-        "</div>" +
-        "<div style='display:grid;grid-template-columns:1fr 1fr;gap:12px;width:150px'>" +
-        "<div class='btn accent' onclick=\"api('key&val=OK')\">A (OK)</div>" +
-        "<div class='btn' onclick=\"api('key&val=BACK')\">B (Back)</div>" +
-        "<div class='btn' onclick=\"api('click')\">X (Tap)</div>" +
-        "<div class='btn' onclick=\"api('key&val=HOME')\">Y (Home)</div>" +
-        "</div></div>" +
-        "<div class='row'><div class='btn accent' onclick=\"api('app&pkg=com.limelight')\">💻 Launch Moonlight PC Streamer</div></div>" +
-        "</div>" +
-        "<script>" +
-        "function api(q){fetch('/api?cmd='+q).catch(()=>{});}" +
-        "function showTab(i){document.querySelectorAll('.tab').forEach((t,idx)=>t.classList.toggle('active',idx===i));document.querySelectorAll('.panel').forEach((p,idx)=>p.classList.toggle('active',idx===i));}" +
-        "function sendUrl(){const v=document.getElementById('urlIn').value;if(v)api('url&val='+encodeURIComponent(v));}" +
-        "function sendTxt(){const v=document.getElementById('txtIn').value;if(v)api('text&val='+encodeURIComponent(v));}" +
-        "const pad=document.getElementById('touchpad');let lx=0,ly=0,moved=false,t0=0,busy=false;" +
-        "pad.addEventListener('touchstart',e=>{const t=e.touches[0];lx=t.clientX;ly=t.clientY;moved=false;t0=Date.now();},{passive:false});" +
-        "pad.addEventListener('touchmove',e=>{e.preventDefault();const t=e.touches[0];const dx=(t.clientX-lx)*1.9,dy=(t.clientY-ly)*1.9;if(Math.abs(dx)>2||Math.abs(dy)>2){moved=true;lx=t.clientX;ly=t.clientY;if(!busy){busy=true;fetch('/api?cmd=move&dx='+dx.toFixed(1)+'&dy='+dy.toFixed(1)).finally(()=>{busy=false;});}}},{passive:false});" +
-        "pad.addEventListener('touchend',e=>{if(!moved&&(Date.now()-t0)<280)api('click');});" +
-        "const sb=document.getElementById('scrollbar');let sy=0,sbusy=false;" +
-        "sb.addEventListener('touchstart',e=>{sy=e.touches[0].clientY;},{passive:false});" +
-        "sb.addEventListener('touchmove',e=>{e.preventDefault();const dy=(e.touches[0].clientY-sy)*3.0;if(Math.abs(dy)>25&&!sbusy){sy=e.touches[0].clientY;sbusy=true;fetch('/api?cmd=scroll&dy='+dy.toFixed(0)).finally(()=>{sbusy=false;});}},{passive:false});" +
-        "</script></body></html>";
+        "body{margin:0;background:#05070E;color:#F8FAFC;font-family:-apple-system,BlinkMacSystemFont,'Inter',sans-serif;display:flex;flex-direction:column;height:100vh;overflow:hidden;}" +
+        "</style></head><body><h2 style='padding:20px;color:#38BDF8'>MiTV Control Server v2.0 Active</h2></body></html>";
 }
