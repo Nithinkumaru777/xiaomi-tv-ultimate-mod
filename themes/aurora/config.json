@@ -1,0 +1,23 @@
+{
+  "background_color": "#070A14",
+  "wallpaper": true,
+  "reduced_motion": true,
+  "focus_overshoot": false,
+  "app_library": true,
+  "library_button": true,
+  "library_ok_opens": true,
+  "library_apps": [
+    "com.brave.browser",
+    "com.limelight"
+  ],
+  "dock_apps": [
+    "com.google.android.youtube.tv",
+    "com.netflix.ninja",
+    "com.amazon.amazonvideo.livingroom",
+    "in.startv.hotstar",
+    "org.smarttube.stable",
+    "com.brave.browser",
+    "com.limelight",
+    "com.gathin.mobilecontrol"
+  ]
+}

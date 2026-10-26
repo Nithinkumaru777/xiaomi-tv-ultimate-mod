@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Mobile Control</string>
+    <string name="service_label">Mobile Mouse, Keyboard &amp; Controller</string>
+    <string name="service_description">Allows your phone browser to act as a wireless touchpad mouse, keyboard, and controller for the TV.</string>
+</resources>
