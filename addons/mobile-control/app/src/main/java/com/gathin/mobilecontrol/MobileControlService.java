@@ -4,10 +4,12 @@ import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
 import android.animation.ValueAnimator;
 import android.app.SearchManager;
+import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.LinearGradient;
@@ -63,6 +65,10 @@ public class MobileControlService extends AccessibilityService {
     private WindowManager windowManager;
     private CursorView cursorView;
     private WindowManager.LayoutParams cursorParams;
+    private VolumeHudView volumeHudView;
+    private WindowManager.LayoutParams volumeHudParams;
+    private boolean volumeHudAdded = false;
+    private BroadcastReceiver volumeChangeReceiver;
     private int screenW = 1280;
     private int screenH = 720;
     private float cursorX = 640f;
@@ -102,12 +108,29 @@ public class MobileControlService extends AccessibilityService {
         sInstance = this;
         setupOverlay();
         startHttpServer();
+
+        try {
+            IntentFilter filter = new IntentFilter();
+            filter.addAction("android.media.VOLUME_CHANGED_ACTION");
+            filter.addAction("com.gathin.mobilecontrol.VOLUME_HUD");
+            volumeChangeReceiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    triggerVolumeHudNow();
+                }
+            };
+            registerReceiver(volumeChangeReceiver, filter);
+        } catch (Throwable ignored) {}
     }
 
     @Override
     public void onDestroy() {
         sInstance = null;
         stopHttpServer();
+        if (volumeChangeReceiver != null) {
+            try { unregisterReceiver(volumeChangeReceiver); } catch (Throwable ignored) {}
+            volumeChangeReceiver = null;
+        }
         removeOverlay();
         super.onDestroy();
     }
@@ -201,6 +224,7 @@ public class MobileControlService extends AccessibilityService {
                 || "com.netflix.ninja".equals(pkg)
                 || "com.amazon.amazonvideo.livingroom".equals(pkg)
                 || "in.startv.hotstar".equals(pkg)
+                || "com.gxnet.castle.indiatv".equals(pkg)
                 || "com.gathin.tvhome".equals(pkg)
                 || "com.android.tv.settings".equals(pkg)
                 || "com.droidlogic.tv.settings".equals(pkg);
@@ -218,6 +242,20 @@ public class MobileControlService extends AccessibilityService {
             return resp != null && resp.startsWith("OK");
         } catch (Throwable t) {
             return false;
+        }
+    }
+
+    private String getDaemonResponse(String cmdLine) {
+        try (Socket s = new Socket()) {
+            s.connect(new InetSocketAddress("127.0.0.1", ShellInputDaemon.DAEMON_PORT), 150);
+            s.setSoTimeout(500);
+            OutputStream out = s.getOutputStream();
+            out.write((cmdLine + "\n").getBytes(StandardCharsets.UTF_8));
+            out.flush();
+            BufferedReader br = new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
+            return br.readLine();
+        } catch (Throwable t) {
+            return null;
         }
     }
 
@@ -340,6 +378,25 @@ public class MobileControlService extends AccessibilityService {
                 cursorView.setVisibility(View.GONE);
                 windowManager.addView(cursorView, cursorParams);
                 cursorAdded = true;
+
+                // Dedicated high-contrast On-Screen Volume Overlay HUD
+                volumeHudView = new VolumeHudView(this);
+                int hudW = (int) (310f * dm.density);
+                int hudH = (int) (62f * dm.density);
+                volumeHudParams = new WindowManager.LayoutParams(
+                        hudW, hudH,
+                        WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                                | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                        PixelFormat.TRANSLUCENT);
+                volumeHudParams.gravity = Gravity.TOP | Gravity.END;
+                volumeHudParams.x = (int) (36f * dm.density);
+                volumeHudParams.y = (int) (36f * dm.density);
+                volumeHudView.setVisibility(View.GONE);
+                volumeHudView.setAlpha(0f);
+                windowManager.addView(volumeHudView, volumeHudParams);
+                volumeHudAdded = true;
             } catch (Exception ignored) {
             }
         });
@@ -354,6 +411,44 @@ public class MobileControlService extends AccessibilityService {
                 }
                 cursorAdded = false;
             }
+            if (volumeHudAdded && windowManager != null && volumeHudView != null) {
+                try {
+                    windowManager.removeView(volumeHudView);
+                } catch (Exception ignored) {
+                }
+                volumeHudAdded = false;
+            }
+        });
+    }
+
+    private final Runnable hideVolumeRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (volumeHudView != null) {
+                volumeHudView.animate().alpha(0f).setDuration(220).withEndAction(() -> {
+                    if (volumeHudView != null) volumeHudView.setVisibility(View.GONE);
+                }).start();
+            }
+        }
+    };
+
+    public void triggerVolumeHudNow() {
+        mainHandler.post(() -> {
+            if (volumeHudView == null || windowManager == null || !volumeHudAdded) return;
+            try {
+                AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
+                if (am == null) return;
+                int vol = am.getStreamVolume(AudioManager.STREAM_MUSIC);
+                int max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+                boolean muted = am.isStreamMute(AudioManager.STREAM_MUSIC) || (vol <= 0);
+
+                mainHandler.removeCallbacks(hideVolumeRunnable);
+                volumeHudView.animate().cancel();
+                volumeHudView.updateState(vol, max, muted, "JBL Cinema SB560 (ARC)");
+                volumeHudView.setVisibility(View.VISIBLE);
+                volumeHudView.setAlpha(1.0f);
+                mainHandler.postDelayed(hideVolumeRunnable, 2400);
+            } catch (Throwable ignored) {}
         });
     }
 
@@ -774,13 +869,20 @@ public class MobileControlService extends AccessibilityService {
                         mainHandler.post(() -> performGlobalAction(GLOBAL_ACTION_RECENTS));
                         break;
                     case "VOL_UP":
-                        if (am != null) am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI);
+                        if (!sendDaemonCmd("KEY " + KeyEvent.KEYCODE_VOLUME_UP) && am != null) {
+                            am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, 0);
+                        }
+                        triggerVolumeHudNow();
                         break;
                     case "VOL_DOWN":
-                        if (am != null) am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI);
+                        if (!sendDaemonCmd("KEY " + KeyEvent.KEYCODE_VOLUME_DOWN) && am != null) {
+                            am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, 0);
+                        }
+                        triggerVolumeHudNow();
                         break;
                     case "MUTE":
-                        if (am != null) am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_TOGGLE_MUTE, AudioManager.FLAG_SHOW_UI);
+                        if (am != null) am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_TOGGLE_MUTE, 0);
+                        triggerVolumeHudNow();
                         break;
                     case "PLAY_PAUSE":
                         if (!sendDaemonCmd("KEY " + KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE) && am != null) {
@@ -1047,14 +1149,24 @@ public class MobileControlService extends AccessibilityService {
                     openUrlInBrave(q.get("val"));
                 } else if ("app".equals(cmd)) {
                     launchPackage(q.get("pkg"));
+                } else if ("auto_arc".equals(cmd)) {
+                    sendDaemonCmd("CONNECT_ARC");
                 }
-                String json = "{\"ok\":true,\"kbSeq\":" + kbSeq.get() + ",\"editable\":" + editableNow + "}";
+                String hdmiJson = getDaemonResponse("GET_HDMI");
+                if (hdmiJson == null || hdmiJson.isEmpty()) {
+                    hdmiJson = "{\"speaker\":\"\",\"port\":0,\"isArcPort\":false,\"arcEstablished\":false,\"systemAudio\":false,\"statusMsg\":\"TV Speakers\"}";
+                }
+                String json = "{\"ok\":true,\"kbSeq\":" + kbSeq.get() + ",\"editable\":" + editableNow + ",\"hdmi\":" + hdmiJson + "}";
                 byte[] body = json.getBytes(StandardCharsets.UTF_8);
                 String header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + body.length + "\r\nConnection: close\r\n\r\n";
                 out.write(header.getBytes(StandardCharsets.UTF_8));
                 out.write(body);
             } else if (path.startsWith("/state")) {
-                String json = "{\"ok\":true,\"kbSeq\":" + kbSeq.get() + ",\"editable\":" + editableNow + "}";
+                String hdmiJson = getDaemonResponse("GET_HDMI");
+                if (hdmiJson == null || hdmiJson.isEmpty()) {
+                    hdmiJson = "{\"speaker\":\"\",\"port\":0,\"isArcPort\":false,\"arcEstablished\":false,\"systemAudio\":false,\"statusMsg\":\"TV Speakers\"}";
+                }
+                String json = "{\"ok\":true,\"kbSeq\":" + kbSeq.get() + ",\"editable\":" + editableNow + ",\"hdmi\":" + hdmiJson + "}";
                 byte[] body = json.getBytes(StandardCharsets.UTF_8);
                 String header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + body.length + "\r\nConnection: close\r\n\r\n";
                 out.write(header.getBytes(StandardCharsets.UTF_8));

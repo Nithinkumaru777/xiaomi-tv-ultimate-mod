@@ -43,6 +43,15 @@ public final class ShellInputDaemon {
 
         try {
             ServerSocket server = new ServerSocket(DAEMON_PORT, 32, InetAddress.getByName("127.0.0.1"));
+            new Thread(() -> {
+                while (true) {
+                    try {
+                        updateHdmiState();
+                        Thread.sleep(3000);
+                    } catch (Throwable ignored) {}
+                }
+            }).start();
+            startPhysicalRemoteVolumeWatcher();
             while (true) {
                 final Socket client = server.accept();
                 new Thread(() -> handleClient(client)).start();
@@ -50,6 +59,178 @@ public final class ShellInputDaemon {
         } catch (Throwable t) {
             t.printStackTrace();
         }
+    }
+
+    private static final java.util.concurrent.atomic.AtomicBoolean isVolRepeating = new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static volatile int activeRepeatKey = 0;
+    private static Thread repeatThread = null;
+
+    private static synchronized void startVolumeRepeat(final int keyCode) {
+        stopVolumeRepeat();
+        isVolRepeating.set(true);
+        activeRepeatKey = keyCode;
+        repeatThread = new Thread(() -> {
+            try {
+                // Initial hold threshold before rapid repeat
+                Thread.sleep(240);
+                while (isVolRepeating.get() && activeRepeatKey == keyCode) {
+                    injectKey(keyCode);
+                    Thread.sleep(90);
+                }
+            } catch (InterruptedException ignored) {}
+        }, "VolRepeatWorker");
+        repeatThread.start();
+    }
+
+    private static synchronized void stopVolumeRepeat() {
+        isVolRepeating.set(false);
+        activeRepeatKey = 0;
+        if (repeatThread != null) {
+            repeatThread.interrupt();
+            repeatThread = null;
+        }
+    }
+
+    private static void startPhysicalRemoteVolumeWatcher() {
+        new Thread(() -> {
+            while (true) {
+                Process p = null;
+                try {
+                    p = Runtime.getRuntime().exec("getevent -l");
+                    BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8));
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        String trimmed = line.trim();
+                        if (trimmed.isEmpty()) continue;
+                        String[] tokens = trimmed.split("\\s+");
+                        // Format: /dev/input/event3: EV_KEY KEY_VOLUMEUP DOWN (or UP)
+                        if (tokens.length >= 4 && "EV_KEY".equals(tokens[1])) {
+                            String key = tokens[2];
+                            String action = tokens[3];
+                            if ("KEY_VOLUMEUP".equals(key)) {
+                                if ("DOWN".equals(action)) {
+                                    startVolumeRepeat(KeyEvent.KEYCODE_VOLUME_UP);
+                                    broadcastVolumeHud();
+                                } else if ("UP".equals(action)) {
+                                    stopVolumeRepeat();
+                                }
+                            } else if ("KEY_VOLUMEDOWN".equals(key)) {
+                                if ("DOWN".equals(action)) {
+                                    startVolumeRepeat(KeyEvent.KEYCODE_VOLUME_DOWN);
+                                    broadcastVolumeHud();
+                                } else if ("UP".equals(action)) {
+                                    stopVolumeRepeat();
+                                }
+                            }
+                        }
+                    }
+                } catch (Throwable t) {
+                    t.printStackTrace();
+                } finally {
+                    if (p != null) {
+                        try { p.destroy(); } catch (Throwable ignored) {}
+                    }
+                }
+                try { Thread.sleep(1500); } catch (Throwable ignored) {}
+            }
+        }, "PhysicalRemoteVolumeWatcher").start();
+    }
+
+    private static void broadcastVolumeHud() {
+        try {
+            Runtime.getRuntime().exec(new String[]{"am", "broadcast", "-a", "com.gathin.mobilecontrol.VOLUME_HUD", "-p", "com.gathin.mobilecontrol"});
+        } catch (Throwable ignored) {}
+    }
+
+    private static volatile String cachedHdmiJson = "{\"speaker\":\"\",\"port\":0,\"isArcPort\":false,\"arcEstablished\":false,\"systemAudio\":false,\"statusMsg\":\"Scanning Audio...\"}";
+    private static volatile long lastScanMs = 0L;
+
+    private static synchronized String getHdmiJson() {
+        long now = SystemClock.uptimeMillis();
+        if (now - lastScanMs > 2200L) {
+            updateHdmiState();
+            lastScanMs = now;
+        }
+        return cachedHdmiJson;
+    }
+
+    private static void updateHdmiState() {
+        try {
+            Process p = Runtime.getRuntime().exec("dumpsys hdmi_control");
+            BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8));
+            String line;
+            boolean arcEst = false;
+            boolean sysAud = false;
+            String name = "";
+            int port = 0;
+            int power = -1;
+
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (line.contains("mArcEstablished: true")) arcEst = true;
+                if (line.contains("mSystemAudioActivated: true")) sysAud = true;
+                if (line.contains("device_type: 5") && line.contains("display_name:")) {
+                    String[] parts = line.split("\\s+");
+                    for (int i = 0; i < parts.length; i++) {
+                        if ("display_name:".equals(parts[i])) {
+                            StringBuilder sb = new StringBuilder();
+                            for (int j = i + 1; j < parts.length; j++) {
+                                if (parts[j].endsWith(":")) break;
+                                if (sb.length() > 0) sb.append(" ");
+                                sb.append(parts[j]);
+                            }
+                            name = sb.toString();
+                        } else if ("port_id:".equals(parts[i]) && i + 1 < parts.length) {
+                            try { port = Integer.parseInt(parts[i + 1]); } catch (Throwable ignored) {}
+                        } else if ("power_status:".equals(parts[i]) && i + 1 < parts.length) {
+                            try { power = Integer.parseInt(parts[i + 1]); } catch (Throwable ignored) {}
+                        }
+                    }
+                }
+            }
+            reader.close();
+            p.waitFor();
+
+            boolean isArc = (port == 1);
+            String msg;
+            if (name.isEmpty()) {
+                msg = "TV Internal Speakers Active";
+            } else if (isArc) {
+                msg = name + " Connected & Active on HDMI 1 (ARC)";
+            } else {
+                msg = name + " on HDMI " + port + ". Move cable to HDMI 1 (ARC) to enable sound.";
+            }
+
+            cachedHdmiJson = "{\"speaker\":\"" + escapeJson(name)
+                    + "\",\"port\":" + port
+                    + ",\"power\":" + power
+                    + ",\"isArcPort\":" + isArc
+                    + ",\"arcEstablished\":" + arcEst
+                    + ",\"systemAudio\":" + sysAud
+                    + ",\"statusMsg\":\"" + escapeJson(msg) + "\"}";
+
+            if (isArc) {
+                autoConnectArc();
+            }
+        } catch (Throwable t) {
+            t.printStackTrace();
+        }
+    }
+
+    private static void autoConnectArc() {
+        try {
+            Runtime.getRuntime().exec(new String[]{"settings", "put", "global", "enable_arc_audio", "1"}).waitFor();
+            Runtime.getRuntime().exec(new String[]{"settings", "put", "global", "tv_sound_device_hdmi_mode", "1"}).waitFor();
+            Runtime.getRuntime().exec(new String[]{"settings", "put", "global", "tv_sound_output_device", "5"}).waitFor();
+            Runtime.getRuntime().exec(new String[]{"settings", "put", "global", "hdmi_control_enabled", "1"}).waitFor();
+            Runtime.getRuntime().exec(new String[]{"settings", "put", "global", "hdmi_control_auto_wakeup_enabled", "1"}).waitFor();
+            Runtime.getRuntime().exec(new String[]{"settings", "put", "global", "hdmi_control_auto_device_off_enabled", "1"}).waitFor();
+        } catch (Throwable ignored) {}
+    }
+
+    private static String escapeJson(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 
     private static void handleClient(Socket client) {
@@ -97,6 +278,12 @@ public final class ShellInputDaemon {
                 } else if ("TEXT".equals(cmd) && parts.length >= 2) {
                     String text = URLDecoder.decode(parts[1], "UTF-8");
                     injectText(text);
+                } else if ("GET_HDMI".equals(cmd)) {
+                    out.write((getHdmiJson() + "\n").getBytes(StandardCharsets.UTF_8));
+                    out.flush();
+                    continue;
+                } else if ("CONNECT_ARC".equals(cmd)) {
+                    autoConnectArc();
                 }
                 out.write("OK\n".getBytes(StandardCharsets.UTF_8));
                 out.flush();
@@ -123,6 +310,9 @@ public final class ShellInputDaemon {
                 KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0, source);
         injectEvent(down);
         injectEvent(up);
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN || keyCode == KeyEvent.KEYCODE_VOLUME_MUTE) {
+            broadcastVolumeHud();
+        }
     }
 
     private static void injectMouseHover(float x, float y) {
@@ -148,41 +338,10 @@ public final class ShellInputDaemon {
     }
 
     private static void injectMouseClick(float x, float y) {
-        try {
-            long downTime = SystemClock.uptimeMillis();
-            MotionEvent.PointerProperties[] props = new MotionEvent.PointerProperties[1];
-            props[0] = new MotionEvent.PointerProperties();
-            props[0].id = 0;
-            props[0].toolType = MotionEvent.TOOL_TYPE_MOUSE;
-
-            MotionEvent.PointerCoords[] coords = new MotionEvent.PointerCoords[1];
-            coords[0] = new MotionEvent.PointerCoords();
-            coords[0].x = x;
-            coords[0].y = y;
-            coords[0].pressure = 1.0f;
-            coords[0].size = 1.0f;
-
-            MotionEvent hover = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_HOVER_MOVE, 1, props, coords,
-                    0, 0, 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_MOUSE, 0);
-            injectEvent(hover);
-            hover.recycle();
-
-            MotionEvent down = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, 1, props, coords,
-                    0, MotionEvent.BUTTON_PRIMARY, 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_MOUSE, 0);
-            injectEvent(down);
-            down.recycle();
-
-            try { Thread.sleep(22); } catch (InterruptedException ignored) {}
-
-            long upTime = SystemClock.uptimeMillis();
-            coords[0].pressure = 0.0f;
-            MotionEvent up = MotionEvent.obtain(downTime, upTime, MotionEvent.ACTION_UP, 1, props, coords,
-                    0, 0, 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_MOUSE, 0);
-            injectEvent(up);
-            up.recycle();
-        } catch (Throwable t) {
-            injectTap(x, y, 30);
-        }
+        // Inject hardware-grade touch tap which Chromium/Android ALWAYS converts into web DOM click:
+        injectTap(x, y, 35);
+        // Keep mouse hover position synchronized:
+        injectMouseHover(x, y);
     }
 
     private static void injectMouseWheelOnly(float x, float y, float dx, float dy) {
